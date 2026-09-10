@@ -170,17 +170,6 @@ void Session::cmd_mail(std::string_view arg) {
         return;
     }
 
-    auto at = addr.find('@');
-    const std::string domain = (at != std::string::npos) ? addr.substr(at + 1) : "";
-    std::string domain_lower = domain;
-    std::transform(domain_lower.begin(), domain_lower.end(), domain_lower.begin(), ::tolower);
-
-    if (domain_lower != get_hostname()) {
-        reply_code(550, "5.7.1 Relaying Denied.");
-        return;
-    }
-
-
     env_.mail_from = std::string(extract_address(arg.substr(5)));
     state_ = SMTPState::Mail;
     reply_code(250, "OK");

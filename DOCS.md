@@ -1,7 +1,7 @@
 > [!NOTE]
-> JAMS - v0.0.1-alpha | Experimental  
+> JAMS - v0.2.1-beta | Experimental  
 > Repository: [DeTraced-Security/JAMS](https://github.com/DeTraced-Security/JAMS)  
-> Security Contact: [detraced-sec@proton.me](mailto:detraced-sec@proton.me)  
+> Security Contact: [detraced-sec@proton.me](mailto:report@mail.detraced.org)  
 
 ---
 # Table of Contents
@@ -54,54 +54,30 @@ No mutable state is shared between threads to ensure data integrity and security
 src/
 
 ├── main.cpp # Entry point, thread spawning, signal handling
-
 ├── globals.hpp # Global shutdown flag
-
-├── io/
-
-│ ├── io_uring_loop.hpp/.cpp # Core async event loop (io_uring wrapper)
-
+├── io/ 
+├── io_uring_loop.hpp/.cpp # Core async event loop (io_uring wrapper)
 │ └── session_factory.hpp # Pluggable session factory pattern
-
 ├── smtp/
-
 │ ├── smtp_session.hpp/.cpp # Inbound SMTP (port 25)
-
 │ └── submission_server.hpp/.cpp # Submission server (port 587)
-
 ├── imap/
-
 │ └── imap_session.hpp/.cpp # IMAP4 + IMAP4S (ports 143 / 993)
-
 ├── tls/
-
 │ ├── tls_context.hpp/.cpp # OpenSSL context management
-
 │ └── tls_conn.hpp/.cpp # TLS wrapper (memory BIO pattern)
-
 ├── auth/
-
 │ ├── cred_store.hpp/.cpp # SQLite-backed user database
-
 │ ├── sasl.hpp/.cpp # SASL PLAIN / LOGIN
-
 │ ├── dkim_verifier.hpp/.cpp # DKIM signature verification (RFC 6376)
-
 │ ├── spf_checker.hpp/.cpp # SPF evaluation (RFC 7208)
-
 │ └── dmarc_checker.hpp/.cpp # DMARC policy (RFC 7489)
-
 ├── dns/
-
 │ ├── dns_resolver.hpp/.cpp # Async stub resolver (io_uring UDP)
-
 │ ├── dns_message.hpp/.cpp # DNS message parsing/encoding
-
 │ └── dns_types.hpp # DNS record types
-
-└── storage/
-
-└── maildir.hpp/.cpp # Maildir format delivery
+├── storage/
+│ └── maildir.hpp/.cpp # Maildir format delivery
 ```
 
 ---
@@ -283,10 +259,11 @@ Standard mailboxes are created automatically per user on first access: `INBOX`/`
 #### IDLE
 JAMS supports `IDLE` for push-like notifications. While a client is in IDLE, the server polls `Maildir/new` and sends `* N EXISTS` upon new arrivals.
 
-#### Zero-Access (Planned)
+#### Encrypted Storage (Planned)
 JAMS, when implemented, will hold message bodies at rest under LZ-Compressed AES-256-GCM encrypted ciphertext. The server will never hold the decryption keys or plaintext data on the disk, unless where necessary and no other route can be taken. Compatible clients will detect the `X-JAMS-Encrypted` header and decrypt locally, on the user’s device.
 
 ---
+
 # Authentication
 ### Credential Store
 
