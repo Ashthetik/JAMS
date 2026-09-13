@@ -6,6 +6,8 @@
 #include "utils/config/toml_parse.hpp"
 #include "globals.hpp"
 #include "auth/credentials/aliases.hpp"
+#include "utils/shutdown.hpp"
+#include "utils/arg_parse.hpp"
 
 #include <csignal>
 #include <cstring>
@@ -16,47 +18,11 @@
 #include <unistd.h>
 
 // build info
-static constexpr const char* JAMS_VERSION = "0.0.1-alpha";
+static constexpr const char* JAMS_VERSION = "0.2.2-beta";
 static const std::string JAMS_HOSTNAME = get_hostname();
 
 // Signal handling
 volatile sig_atomic_t g_shutdown = 0;
-static void handle_signal(int sig) {
-    g_shutdown = 1;
-
-    // Write sig number to stderr without ynsafe async functions
-    const char* msg = (sig == SIGINT)
-        ? "\n[JAMS] SIGINT received... Shutting down\n"
-        : "\n[JAMS] SIGTERM received... Shutting down\n";
-
-    ssize_t is_ok = write(STDERR_FILENO, msg, strlen(msg));
-
-    if (is_ok < 0) {
-        // Cannot safely use std::cerr/printf here.
-        // Nothing useful can be done in a signal handler.
-    }
-}
-
-void help(const char* prog) {
-    std::cerr << "Usage: " << prog << " [options]"
-        << "\n"
-        << "Server Configuration are made via the `../config/server.toml` file"
-        << "\n--add-user <username> <password> - For quick test provisioning of accounts\n"
-        << "\n"
-        << "notes:\n"
-        << "  ports below 1024 require CAP_NET_BIND_SERVICE or root\n"
-        << "  set with: sudo setcap cap_net_bind_service=+ep ./mailserver" << std::endl;
-}
-
-void banner() {
-    std::cout
-        << "┌─────────────────────────────────────────┐\n"
-        << "│   JAMS — Just Another Mail Server       │\n"
-        << "│   version " << JAMS_VERSION
-        << "                   │\n"
-        << "│   github.com/DeTraced-Security/JAMS     │\n"
-        << "└─────────────────────────────────────────┘\n";
-}
 
 struct Config {
     uint16_t smtp_port;
@@ -66,57 +32,19 @@ struct Config {
     std::string db_path;
 };
 
-
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "--help") {
-        help("mailserver");
-        return 0;
-    }
-
-    if (argc > 1 && std::string(argv[1]) == "--no-logs") {
-        logs_enabled = false;
-    }
-    else {
-        logs_enabled = true;
-    }
-
     Config cfg;
 
-    for (auto& p : configs) {
-        if (p.first == "smtp") {
-            cfg.smtp_port = std::stoi(p.second);
-        }
-        if (p.first == "imap4") {
-            cfg.imap4_port = std::stoi(p.second);
-        }
-        if (p.first == "imap4s") {
-            cfg.imap4_secure_port = std::stoi(p.second);
-        }
-        if (p.first == "submissions") {
-            cfg.submission_port = std::stoi(p.second);
-        }
-        if (p.first == "db_path") {
-            cfg.db_path = p.second;
-        }
-    }
+    // Process our CLI args
+    arg_parse(argc, argv, cfg);
 
+    // Display our versioning banner, this persists the no-log 
+    // for liveness reasons.
     banner();
 
-    // Signal monitor setup
-    struct sigaction sig_action {};
-    sig_action.sa_handler = handle_signal;
-    sigemptyset(&sig_action.sa_mask);
-    sig_action.sa_flags = SA_RESTART;
-
-    sigaction(SIGINT, &sig_action, nullptr);
-    sigaction(SIGTERM, &sig_action, nullptr);
-
-    // SIGPIPE
-    signal(SIGPIPE, SIG_IGN);
-
-    // Credential Storage
     logger.info("[JAMS] Opening user database: " + cfg.db_path);
     Auth::CredentialStore cred_store(cfg.db_path);
+    Auth::Aliases aliases(cred_store);
 
     if (cred_store.db_ == nullptr) {
         logger.error(
@@ -129,7 +57,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    Auth::Aliases aliases(cred_store);
+    // Signal monitor setup
+    struct sigaction sig_action = {};
+    sig_action.sa_handler = handle_signal;
+    sigemptyset(&sig_action.sa_mask);
+    sig_action.sa_flags = SA_RESTART;
+
+    sigaction(SIGHUP, &sig_action, nullptr);
+    sigaction(SIGTERM, &sig_action, nullptr);
+    sigaction(SIGINT, &sig_action, nullptr);
+
+    // SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
 
     // SMTP inbound loop
     logger.info("[JAMS] Starting SMTP inbound on port: " + std::to_string(cfg.smtp_port));
@@ -208,10 +147,10 @@ int main(int argc, char* argv[]) {
         }
         });
 
-    smtp_thread.join();
-    submission_thread.join();
-    imap4_thread.join();
-    imap4_secure_thread.join();
+    threads.emplace_back(std::move(smtp_thread));
+    threads.emplace_back(std::move(imap4_thread));
+    threads.emplace_back(std::move(imap4_secure_thread));
+    threads.emplace_back(std::move(submission_thread));
 
     logger.info("[JAMS] Exiting...");
 
