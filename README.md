@@ -26,4 +26,4 @@ The above list will be marked with the following symbols to indicate status:
 - 🟠 -> In Progress
 - ⚠️ -> Known Security Risk - Awaiting Patch
 
-If there's any bugs please open a ticket, or if there's any security issues, contact us at: detraced-sec@proton.me (ironic, right?) providing a detailed report regarding the vulnerability and we'll review and triage accordingly, within 28 days of submission.
+If there's any bugs please open a ticket, or if there's any security issues, contact us at: tr4ceang3l@proton.me (ironic, right?) providing a detailed report regarding the vulnerability and we'll review and triage accordingly, within 28 days of submission.
