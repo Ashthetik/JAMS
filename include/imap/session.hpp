@@ -98,6 +98,10 @@ namespace IMAP {
 
         void cmd_create(const std::string& tag, const std::string& args);
 
+        void cmd_idle(const std::string& tag);
+
+        void cmd_idle_done();
+
         void complete_append();
 
 
@@ -130,7 +134,13 @@ namespace IMAP {
 
         void ensure_standard_folders();
 
+        void notify_new_email();
+
         std::vector<uint32_t> parse_sequence_set(const std::string& set) const;
+
+        /// @brief Renames the maildir file so its ":2,<flags>" suffix matches msg.flags
+        /// @param msg
+        void persist_flags(MessageMeta& msg);
 
         /// @brief Fetches the given message from the maildir
         /// @param msg 
@@ -212,6 +222,8 @@ namespace IMAP {
         std::string selected_mailbox_;
         bool read_only_{ false };
         bool auth_pending_{ false };
+        bool is_idle_active_{ false };
+        std::string idle_tag_;
         std::string auth_tag_;
 
         // APPEND ingestion state

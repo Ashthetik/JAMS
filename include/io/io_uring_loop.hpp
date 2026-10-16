@@ -28,6 +28,13 @@ enum class op_type : uint8_t {
     Timer = 4,
 };
 
+/// @brief Structure for our IDLE tracker
+struct IdleWatcher {
+    uint64_t conn_id;
+    std::string username;
+    std::string mailbox;
+};
+
 /// @brief Encodes data to ensure integrity and avoid dangling references
 /// @param op 
 /// @param conn_id 
@@ -106,6 +113,12 @@ namespace Async {
 
         void arm_periodic_timer(std::chrono::seconds interval, std::function<void()> callback);
 
+        void register_idle_session(uint64_t conn_id, const std::string& username, const std::string& mailbox);
+
+        void unregister_idle_session(uint64_t conn_id);
+
+        void notify_idle_watchers(const std::string& username, const std::string& mailbox);
+
     private:
         struct PeriodicTimer {
             __kernel_timespec ts;
@@ -175,5 +188,6 @@ namespace Async {
         std::unordered_map<uint64_t, ConnBuffer> buffers_;
         std::unordered_map<uint64_t, std::unique_ptr<SMTP::ISession>> sessions_;
         std::unordered_map<uint64_t, std::unique_ptr<TLS::Connection>> tls_conns_;
+        std::vector<IdleWatcher> idle_watchers_;
     };
 };
