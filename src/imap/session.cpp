@@ -262,9 +262,57 @@ void Session::process_line(const std::string& line) {
             cmd_close(tag);
             return;
         }
+
+        if (command == "IDLE") {
+            cmd_idle(tag);
+            return;
+        }
+
+        if (command == "DONE" && is_idle_active_) {
+            cmd_idle_done();
+            return;
+        }
     }
 
     bad(tag, "Command not recognised in current state");
+}
+
+void Session::cmd_idle(const std::string& tag) {
+    if (state_ != State::Authenticated && state_ != State::Selected) {
+        bad(tag, "IDLE requires authenticated state");
+        return;
+    }
+
+    idle_tag_ = tag;
+    is_idle_active_ = true;
+
+    send("+ idling");
+
+    loop_.register_idle_session(conn_id_, username_, selected_mailbox_);
+}
+
+void Session::cmd_idle_done() {
+    if (!is_idle_active_) {
+        return;
+    }
+
+    is_idle_active_ = false;
+    loop_.unregister_idle_session(conn_id_);
+
+    // Refresh our states
+    if (state_ == State::Selected) {
+        size_t old_count = messages_.size();
+
+        incorporate_new();
+
+        if (messages_.size() != old_count) {
+            untagged(std::to_string(messages_.size()) + " EXISTS");
+            untagged("0 RECENT");
+        }
+    }
+
+    ok(idle_tag_, "IDLE Terminated");
+    idle_tag_.clear();
 }
 
 void Session::cmd_capability(const std::string& tag) {
