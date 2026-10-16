@@ -102,6 +102,17 @@ void Session::process_line(const std::string& line) {
         return;
     }
 
+    if (is_idle_active_) {
+        std::string upper = line;
+        std::transform(upper.begin(), upper.end(), upper.begin(), ::tolower);
+
+        if (upper == "DONE") {
+            cmd_idle_done();
+        }
+
+        return;
+    }
+
     if (auth_pending_) {
         auth_pending_ = false;
         complete_plain_auth(auth_tag_, line);
@@ -109,13 +120,13 @@ void Session::process_line(const std::string& line) {
         return;
     }
 
-    if (line.find_first_of("LOGIN \"") == 0) { /// Ignore credentials 
-        logger.debug("[IMAP] " + std::to_string(conn_id_) + " " + line);
-    }
-
     std::istringstream ss(line);
     std::string tag, command;
     ss >> tag >> command;
+
+    if (command != "LOGIN" && command != "AUTHENTICATE") {
+        logger.debug("[IMAP] " + std::to_string(conn_id_) + " " + line);
+    }
 
     std::string args;
     std::getline(ss, args);
@@ -199,6 +210,11 @@ void Session::process_line(const std::string& line) {
             return;
         }
 
+        if (command == "IDLE") {
+            cmd_idle(tag);
+            return;
+        }
+
         if (command == "SUBSCRIBE" || command == "UNSUBSCRIBE") {
             // stub until Subscribe is implemented (beta)
             ok(tag, command + " completed");
@@ -260,16 +276,6 @@ void Session::process_line(const std::string& line) {
 
         if (command == "CLOSE") {
             cmd_close(tag);
-            return;
-        }
-
-        if (command == "IDLE") {
-            cmd_idle(tag);
-            return;
-        }
-
-        if (command == "DONE" && is_idle_active_) {
-            cmd_idle_done();
             return;
         }
     }
@@ -799,9 +805,13 @@ void Session::cmd_fetch(const std::string& tag, const std::string& args) {
             !read_only_
             ) {
             if (itr->flags.find("\\Seen") == std::string::npos) {
-                itr->flags += " \\Seen";
+                itr->flags += itr->flags.empty() ? " \\Seen" : " \\Seen";
+                persist_flags(*itr);
             }
         }
+
+        std::string response = fetch_message(*itr, items);
+        untagged(response);
     }
 
     ok(tag, "FETCH completed");
@@ -900,6 +910,44 @@ std::string Session::build_body(const MessageMeta& msg) const {
         + std::to_string(msg.size) + " NIL NIL NIL)";
 }
 
+void Session::persist_flags(MessageMeta& msg) {
+    auto flag_chars = [](const std::string& flags) {
+        // Maildir requires flag letters in ASCII order: D F R S T
+        std::string s;
+        if (flags.find("\\Draft") != std::string::npos)    s += 'D';
+        if (flags.find("\\Flagged") != std::string::npos)  s += 'F';
+        if (flags.find("\\Answered") != std::string::npos) s += 'R';
+        if (flags.find("\\Seen") != std::string::npos)     s += 'S';
+        if (flags.find("\\Deleted") != std::string::npos)  s += 'T';
+        return s;
+        };
+
+    std::string base = msg.filename;
+    auto colon = base.find(":2,");
+    if (colon != std::string::npos) {
+        base = base.substr(0, colon);
+    }
+
+    std::string new_name = base + ":2," + flag_chars(msg.flags);
+    if (new_name == msg.filename) {
+        return; // nothing changed
+    }
+
+    std::string old_path = message_path(msg);
+
+    MessageMeta renamed = msg;
+    renamed.filename = new_name;
+    std::string new_path = message_path(renamed);
+
+    if (::rename(old_path.c_str(), new_path.c_str()) == 0) {
+        msg.filename = new_name;
+    }
+    else {
+        logger.error("[IMAP] persist_flags rename failed: " + old_path
+            + " -> " + new_path + " (" + std::strerror(errno) + ")");
+    }
+}
+
 void Session::cmd_store(const std::string& tag, const std::string& args) {
     if (read_only_) {
         no(tag, "[READ-ONLY] Mailbox is read-only");
@@ -956,48 +1004,7 @@ void Session::cmd_store(const std::string& tag, const std::string& args) {
         }
 
         // Persist flags to disk
-        {
-            auto flag_chars = [](const std::string& flags) {
-                std::string s;
-                if (flags.find("\\Seen") != std::string::npos) {
-                    s += 'S';
-                }
-                if (flags.find("\\Answered") != std::string::npos) {
-                    s += 'R';
-                }
-                if (flags.find("\\Flagged") != std::string::npos) {
-                    s += 'F';
-                }
-                if (flags.find("\\Deleted") != std::string::npos) {
-                    s += 'T';
-                }
-                if (flags.find("\\Draft") != std::string::npos) {
-                    s += 'D';
-                }
-
-                return s;
-                };
-
-            std::string base = itr->filename;
-            auto colon = base.find(":2,");
-            if (colon != std::string::npos) {
-                base = base.substr(0, colon);
-            }
-
-            std::string new_name = base + ":2," + flag_chars(itr->flags);
-            if (new_name != itr->filename) {
-                std::string dir = itr->in_cur ? "/cur/" : "/new/";
-                std::string old_path = message_path(*itr);
-
-                MessageMeta renamed = *itr;
-                renamed.filename = new_name;
-                std::string new_path = message_path(renamed);
-
-                if (::rename(old_path.c_str(), new_path.c_str()) == 0) {
-                    itr->filename = new_name;
-                }
-            }
-        }
+        persist_flags(*itr);
 
         // Send FETCH unless .SILENT is present
         if (upper.find(".SILENT") == std::string::npos) {
