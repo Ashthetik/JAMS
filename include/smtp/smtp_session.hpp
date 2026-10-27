@@ -33,11 +33,13 @@ namespace SMTP {
         /// @brief Creates the SMTP Session
         /// @param conn_id 
         /// @param remote_ip 
-        /// @param loop 
+        /// @param loop
+        /// @param cred_store Used to accept mail only for accounts that exist
         Session(
             uint64_t conn_id,
             std::string remote_ip,
-            Async::IoUringLoop& loop, Auth::Aliases& aliases
+            Async::IoUringLoop& loop, Auth::CredentialStore& cred_store,
+            Auth::Aliases& aliases
         );
 
         /// @brief Handles events that receive on-wire data
@@ -126,6 +128,7 @@ namespace SMTP {
         uint64_t conn_id_;
         std::string remote_ip_;
         Async::IoUringLoop& loop_;
+        Auth::CredentialStore& cred_store_;
         Auth::Aliases& aliases_;
 
         SMTPState state_{ SMTPState::Connected };
