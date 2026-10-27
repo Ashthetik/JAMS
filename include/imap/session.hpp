@@ -128,6 +128,18 @@ namespace IMAP {
 
         void ensure_mailbox_dirs(const std::string& mailbox);
 
+        /// @brief Checks a client-supplied mailbox name before it is used to build a path.
+        /// Rejects separators, dot segments, control characters and Maildir internals
+        /// so a mailbox name can never resolve outside the user's own Maildir
+        /// @param mailbox
+        /// @return
+        static bool is_valid_mailbox_name(const std::string& mailbox);
+
+        /// @brief Builds the Maildir directory for a mailbox that has already been validated
+        /// @param mailbox
+        /// @return
+        std::string mailbox_root(const std::string& mailbox) const;
+
         void ensure_standard_folders();
 
         std::vector<uint32_t> parse_sequence_set(const std::string& set) const;
