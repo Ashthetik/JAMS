@@ -41,7 +41,14 @@ void help(const char* prog) {
     std::cerr << "Usage: " << prog << " [options]"
         << "\n"
         << "Server Configuration are made via the `../config/server.toml` file"
-        << "\n--add-user <username> <password> - For quick test provisioning of accounts\n"
+        << "\n  --add-user <username> <password>  create an account and exit"
+        << "\n  --no-logs                         disable logging"
+        << "\n  --help                            show this message\n"
+        << "\n"
+        << "environment:\n"
+        << "  JAMS_PEPPER    required, secret used to derive password salts (keep it stable)\n"
+        << "  JAMS_CONFIG    path to server.toml (default ../config/server.toml)\n"
+        << "  JAMS_LOG_PATH  path to the log file (default ../logs/jams.txt)\n"
         << "\n"
         << "notes:\n"
         << "  ports below 1024 require CAP_NET_BIND_SERVICE or root\n"
@@ -68,16 +75,56 @@ struct Config {
 
 
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "--help") {
-        help("mailserver");
-        return 0;
+    logs_enabled = true;
+
+    std::string add_username{};
+    std::string add_password{};
+    bool add_user_requested{ false };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg{ argv[i] };
+
+        if (arg == "--help") {
+            help("mailserver");
+            return 0;
+        }
+        else if (arg == "--no-logs") {
+            logs_enabled = false;
+        }
+        else if (arg == "--add-user") {
+            if (i + 2 >= argc) {
+                std::cerr << "[JAMS] --add-user requires <username> <password>" << std::endl;
+                return 1;
+            }
+
+            add_username = argv[++i];
+            add_password = argv[++i];
+            add_user_requested = true;
+        }
+        else if (arg == "--db" || arg == "--smtp-port") {
+            // Older docs, the Dockerfile and systemd examples pass these; they were never read
+            if (i + 1 < argc) {
+                ++i;
+            }
+
+            std::cerr << "[JAMS] Ignoring " << arg << ": set it in server.toml instead" << std::endl;
+        }
+        else {
+            std::cerr << "[JAMS] Unknown option: " << arg << std::endl;
+            help("mailserver");
+            return 1;
+        }
     }
 
-    if (argc > 1 && std::string(argv[1]) == "--no-logs") {
-        logs_enabled = false;
-    }
-    else {
-        logs_enabled = true;
+    /**
+     * Password salts are derived from JAMS_PEPPER, so without it no login can
+     * ever succeed. Refuse to start rather than run with authentication silently broken.
+     */
+    if (std::getenv("JAMS_PEPPER") == nullptr || std::string(std::getenv("JAMS_PEPPER")).empty()) {
+        std::cerr << "[FATAL] [JAMS] JAMS_PEPPER is not set. It is required to hash and verify passwords.\n"
+            << "        Set it to a long random secret and keep it stable: changing or losing it\n"
+            << "        invalidates every stored password." << std::endl;
+        return 1;
     }
 
     Config cfg;
@@ -127,6 +174,22 @@ int main(int argc, char* argv[]) {
         );
 
         return 1;
+    }
+
+    if (add_user_requested) {
+        if (cred_store.user_exists(add_username)) {
+            std::cerr << "[JAMS] User already exists: " << add_username << std::endl;
+            return 1;
+        }
+
+        if (!cred_store.add_user(add_username, add_password, "")) {
+            std::cerr << "[JAMS] Failed to create user: " << add_username
+                << " (usernames may only contain letters, digits, '.', '-', '_' and '+')" << std::endl;
+            return 1;
+        }
+
+        std::cout << "[JAMS] User created: " << add_username << std::endl;
+        return 0;
     }
 
     Auth::Aliases aliases(cred_store);

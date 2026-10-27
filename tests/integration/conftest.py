@@ -32,8 +32,18 @@ def wait_for_port(port, timeout=10):
 def jams_server():
     os.makedirs("/tmp/jams/logs", exist_ok=True)
 
+    # sudo resets the environment, so the pepper and paths have to be passed through explicitly
+    sudo = ["sudo", "--preserve-env=JAMS_PEPPER,JAMS_CONFIG,JAMS_LOG_PATH"]
+
+    # Seed the test account first; a non-zero exit just means it already exists from an earlier run
+    subprocess.run(
+        sudo + [JAMS_BIN, "--add-user", "ci-test-user", "ci-test-password"],
+        cwd=os.path.dirname(JAMS_CONFIG),
+        timeout=30
+    )
+
     proc = subprocess.Popen(
-        ["sudo", JAMS_BIN, "--add-user", "ci-test-user", "ci-test-password"],
+        sudo + [JAMS_BIN],
         cwd=os.path.dirname(JAMS_CONFIG),
         stdout=open("/tmp/jams/logs/stdout.log", "w"),
         stderr=open("/tmp/jams/logs/stderr.log", "w")

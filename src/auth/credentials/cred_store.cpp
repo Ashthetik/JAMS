@@ -146,6 +146,14 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
         return false;
     }
 
+    // Same allowlist as verify(), otherwise the account could never log in
+    for (const char c : username) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_' && c != '+') {
+            logger.warn("[AUTH] add_user rejected unsafe username");
+            return false;
+        }
+    }
+
     if (user_exists(username)) {
         return false;
     }
@@ -155,7 +163,13 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 
-    auto hashed_ip = hash_data(ip);
+    /**
+     * Accounts created offline (e.g. via --add-user) have no known IP yet.
+     * Storing NULL rather than a hash of "" means the first real login isn't
+     * treated as an unknown-IP login.
+     */
+    const bool has_ip = !ip.empty();
+    auto hashed_ip = has_ip ? hash_data(ip) : HashedPassword{};
 
     // SQLite Statement
     sqlite3_stmt* stmt = nullptr;
@@ -173,7 +187,12 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
     sqlite3_bind_text(stmt, 2, hashed.hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 3, hashed.iterations);
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(now));
-    sqlite3_bind_text(stmt, 5, hashed_ip.hash.c_str(), -1, SQLITE_STATIC);
+    if (has_ip) {
+        sqlite3_bind_text(stmt, 5, hashed_ip.hash.c_str(), -1, SQLITE_STATIC);
+    }
+    else {
+        sqlite3_bind_null(stmt, 5);
+    }
 
     bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt); // Construct the statement with the binds
