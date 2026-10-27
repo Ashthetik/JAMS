@@ -14,8 +14,8 @@
 #include <cassert>
 
 Async::IoUringLoop::IoUringLoop(
-    uint16_t port, SessionFactory factory, unsigned queue_depth
-) : port_(port), session_factory_(std::move(factory)) {
+    uint16_t port, SessionFactory factory, bool implicit_tls, unsigned queue_depth
+) : port_(port), implicit_tls_(implicit_tls), session_factory_(std::move(factory)) {
     io_uring_params params{};
     params.flags = 0;
 
@@ -272,6 +272,18 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     buf.fd = client_fd;
     buf.read_buf.resize(READ_BUF_SIZE);
 
+    // Implicit TLS: the handshake starts before the session exists, so its
+    // greeting is held until the handshake completes and goes out encrypted
+    if (implicit_tls_) {
+        if (!tls_ctx_) {
+            logger.error("[TLS] conn=" + std::to_string(cid) + " implicit TLS listener has no TLS context");
+            submit_close(cid);
+            return;
+        }
+
+        attach_tls(cid);
+    }
+
     // queue the 220 Banner (making the session available)
     try {
         sessions_[cid] = session_factory_(cid, ip_buf, *this);
@@ -322,9 +334,31 @@ void Async::IoUringLoop::on_read(uint64_t conn_id, int res) {
     if (tit != tls_conns_.end()) {
         try
         {
+            const bool was_handshake_done = tit->second->handshake_done();
+
             auto to_send = tit->second->feed_encryption(data);
             if (!to_send.empty()) {
                 submit_write(conn_id, std::move(to_send), true);
+            }
+
+            if (!was_handshake_done && tit->second->handshake_done()) {
+                /**
+                 * Order matters here: the handshake's final flight (queued above),
+                 * then anything the session wrote during the handshake (e.g. the
+                 * IMAPS greeting), and only then the client's first command.
+                 * Clients often send that command in the same packet as their
+                 * Finished message, and OpenSSL is still holding it, so it has to
+                 * be read now or it sits there until the client sends more.
+                 */
+                flush_pending_plaintext(conn_id);
+
+                auto again = tls_conns_.find(conn_id);
+                if (again != tls_conns_.end()) {
+                    auto more = again->second->feed_encryption({});
+                    if (!more.empty()) {
+                        submit_write(conn_id, std::move(more), true);
+                    }
+                }
             }
         }
         catch (const std::exception& e)
@@ -467,6 +501,17 @@ void Async::IoUringLoop::submit_write(uint64_t conn_id, std::vector<uint8_t> dat
     if (!raw) {
         auto tit = tls_conns_.find(conn_id);
 
+        /**
+         * Mid-handshake there is no session key yet. Sending this as-is would
+         * put plaintext on a connection the client expects to be encrypted,
+         * so hold it until the handshake completes.
+         */
+        if (tit != tls_conns_.end() && !tit->second->handshake_done()) {
+            auto& pending = bit->second.pending_plaintext;
+            pending.insert(pending.end(), data.begin(), data.end());
+            return;
+        }
+
         if (tit != tls_conns_.end() && tit->second->handshake_done()) {
             try {
                 data = tit->second->encrypt(data);
@@ -533,6 +578,12 @@ void Async::IoUringLoop::upgrade_tls(uint64_t conn_id) {
         return;
     }
 
+    logger.info("[TLS] conn=" + std::to_string(conn_id) + " upgrading to TLS");
+
+    attach_tls(conn_id);
+}
+
+void Async::IoUringLoop::attach_tls(uint64_t conn_id) {
     auto tls = std::make_unique<TLS::Connection>(
         tls_ctx_->new_server_ssl(),
         [this, conn_id](std::span<const uint8_t> plain) {
@@ -543,9 +594,19 @@ void Async::IoUringLoop::upgrade_tls(uint64_t conn_id) {
         }
     );
 
-    logger.info("[TLS] conn=" + std::to_string(conn_id) + " upgrading to TLS");
-
     tls_conns_[conn_id] = std::move(tls);
+}
+
+void Async::IoUringLoop::flush_pending_plaintext(uint64_t conn_id) {
+    auto bit = buffers_.find(conn_id);
+    if (bit == buffers_.end() || bit->second.pending_plaintext.empty()) {
+        return;
+    }
+
+    std::vector<uint8_t> pending = std::move(bit->second.pending_plaintext);
+    bit->second.pending_plaintext.clear();
+
+    submit_write(conn_id, std::move(pending));
 }
 
 io_uring_sqe* Async::IoUringLoop::get_sqe() {

@@ -259,9 +259,10 @@ int main(int argc, char* argv[]) {
 
     std::thread imap4_secure_thread([&]() {
         try {
+            // IMAPS (RFC 8314): TLS starts on connect, before the greeting
             Async::IoUringLoop imap4_secure_loop(cfg.imap4_secure_port, [&cred_store](uint64_t id, const std::string& ip, Async::IoUringLoop& loop) {
                 return std::make_unique<IMAP::Session>(id, ip, loop, cred_store, get_mailroot());
-                });
+                }, true);
             imap4_secure_loop.run();
         }
         catch (const std::exception& ex) {

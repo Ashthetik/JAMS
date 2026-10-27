@@ -1,5 +1,5 @@
 # tests/integration/test_imap_append_limits.py
-import socket, pytest
+import socket, ssl, pytest
 
 IMAP_PORT = 2143
 ALL_PORTS = [2525, 2587, 2143, 2993]
@@ -17,16 +17,33 @@ def recv_until(s, marker, timeout=5):
         pass
     return data
 
+IMPLICIT_TLS_PORTS = {2993}
+
 def assert_server_alive():
     for port in ALL_PORTS:
         with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            if port in IMPLICIT_TLS_PORTS:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname="localhost")
+
             s.settimeout(5)
             assert s.recv(1024), f"port {port} accepted but sent no greeting, server may be down"
 
 @pytest.fixture
 def imap_session(jams_server):
-    s = socket.create_connection(("127.0.0.1", IMAP_PORT), timeout=5)
-    s.recv(1024)
+    # Plaintext LOGIN is refused, so upgrade with STARTTLS first
+    raw = socket.create_connection(("127.0.0.1", IMAP_PORT), timeout=5)
+    raw.recv(1024)
+    raw.sendall(b"t1 STARTTLS\r\n")
+    recv_until(raw, b"t1 ")
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    s = ctx.wrap_socket(raw, server_hostname="localhost")
+
     s.sendall(b"a1 LOGIN ci-test-user ci-test-password\r\n")
     reply = recv_until(s, b"a1 ")
 

@@ -68,9 +68,10 @@ namespace Async {
         using SessionFactory = std::function<std::unique_ptr<SMTP::ISession>(uint64_t, const std::string&, IoUringLoop&)>;
 
         /// @brief Initialise io_uring with a queue depth of 256
-        /// @param port 
-        /// @param queue_depth 
-        explicit IoUringLoop(uint16_t port, SessionFactory factory, unsigned queue_depth = 256);
+        /// @param port
+        /// @param implicit_tls Start TLS on accept (e.g. IMAPS on 993) instead of waiting for STARTTLS
+        /// @param queue_depth
+        explicit IoUringLoop(uint16_t port, SessionFactory factory, bool implicit_tls = false, unsigned queue_depth = 256);
         ~IoUringLoop();
 
         IoUringLoop(const IoUringLoop&) = delete;
@@ -102,6 +103,19 @@ namespace Async {
         bool is_tls_active(uint64_t conn_id)  const {
             auto itr = tls_conns_.find(conn_id);
             return itr != tls_conns_.end() && itr->second->handshake_done();
+        }
+
+        /// @brief True if this connection is TLS or is in the middle of a TLS handshake
+        /// @param conn_id
+        /// @return
+        bool has_tls(uint64_t conn_id) const {
+            return tls_conns_.contains(conn_id);
+        }
+
+        /// @brief True if this listener starts TLS on accept rather than via STARTTLS
+        /// @return
+        bool is_implicit_tls() const {
+            return implicit_tls_;
         }
 
         void arm_periodic_timer(std::chrono::seconds interval, std::function<void()> callback);
@@ -167,7 +181,20 @@ namespace Async {
             bool closing{ false };
             int inflight{ 0 };
             int fd{ -1 };
+
+            // Plaintext queued while a TLS handshake is still running; encrypted and sent once it completes
+            std::vector<uint8_t> pending_plaintext;
         };
+
+        /// @brief Creates the TLS state for a connection and routes decrypted bytes to its session
+        /// @param conn_id
+        void attach_tls(uint64_t conn_id);
+
+        /// @brief Encrypts and sends anything queued while the handshake was in progress
+        /// @param conn_id
+        void flush_pending_plaintext(uint64_t conn_id);
+
+        bool implicit_tls_{ false };
 
         SessionFactory session_factory_;
 
