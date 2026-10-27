@@ -10,3 +10,7 @@ submissions = 2587
 
 [database]
 dbpath = "/tmp/jams/db/users.db"
+
+[limits]
+# Short so the idle timeout tests finish quickly
+idle_timeout = 5

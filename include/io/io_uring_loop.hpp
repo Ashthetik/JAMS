@@ -75,9 +75,10 @@ namespace Async {
         using SessionFactory = std::function<std::unique_ptr<SMTP::ISession>(uint64_t, const std::string&, IoUringLoop&)>;
 
         /// @brief Initialise io_uring with a queue depth of 256
-        /// @param port 
-        /// @param queue_depth 
-        explicit IoUringLoop(uint16_t port, SessionFactory factory, unsigned queue_depth = 256);
+        /// @param port
+        /// @param implicit_tls Start TLS on accept (e.g. IMAPS on 993) instead of waiting for STARTTLS
+        /// @param queue_depth
+        explicit IoUringLoop(uint16_t port, SessionFactory factory, bool implicit_tls = false, unsigned queue_depth = 256);
         ~IoUringLoop();
 
         IoUringLoop(const IoUringLoop&) = delete;
@@ -111,6 +112,19 @@ namespace Async {
             return itr != tls_conns_.end() && itr->second->handshake_done();
         }
 
+        /// @brief True if this connection is TLS or is in the middle of a TLS handshake
+        /// @param conn_id
+        /// @return
+        bool has_tls(uint64_t conn_id) const {
+            return tls_conns_.contains(conn_id);
+        }
+
+        /// @brief True if this listener starts TLS on accept rather than via STARTTLS
+        /// @return
+        bool is_implicit_tls() const {
+            return implicit_tls_;
+        }
+
         void arm_periodic_timer(std::chrono::seconds interval, std::function<void()> callback);
 
         void register_idle_session(uint64_t conn_id, const std::string& username, const std::string& mailbox);
@@ -120,6 +134,16 @@ namespace Async {
         void notify_idle_watchers(const std::string& username, const std::string& mailbox);
 
     private:
+        /// @brief Closes connections that have been silent longer than their session's idle timeout
+        void close_idle_connections();
+
+        /// @brief Silence allowed before a connection is closed ([limits] idle_timeout, RFC 5321 4.5.3.2 floor)
+        std::chrono::seconds idle_timeout_;
+
+        /// @brief Open connections allowed on this listener, and from any one address
+        size_t max_connections_;
+        size_t max_connections_per_ip_;
+
         struct PeriodicTimer {
             __kernel_timespec ts;
             std::function<void()> callback;
@@ -174,13 +198,28 @@ namespace Async {
 
         static constexpr size_t READ_BUF_SIZE = 8192;
         struct ConnBuffer {
+            std::string ip;
+            std::chrono::steady_clock::time_point last_active{ std::chrono::steady_clock::now() };
             std::vector<uint8_t> read_buf;
             std::deque<std::vector<uint8_t>> write_queue;
             bool write_pending{ false };
             bool closing{ false };
             int inflight{ 0 };
             int fd{ -1 };
+
+            // Plaintext queued while a TLS handshake is still running; encrypted and sent once it completes
+            std::vector<uint8_t> pending_plaintext;
         };
+
+        /// @brief Creates the TLS state for a connection and routes decrypted bytes to its session
+        /// @param conn_id
+        void attach_tls(uint64_t conn_id);
+
+        /// @brief Encrypts and sends anything queued while the handshake was in progress
+        /// @param conn_id
+        void flush_pending_plaintext(uint64_t conn_id);
+
+        bool implicit_tls_{ false };
 
         SessionFactory session_factory_;
 

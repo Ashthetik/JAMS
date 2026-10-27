@@ -146,6 +146,14 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
         return false;
     }
 
+    // Same allowlist as verify(), otherwise the account could never log in
+    for (const char c : username) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != '_' && c != '+') {
+            logger.warn("[AUTH] add_user rejected unsafe username");
+            return false;
+        }
+    }
+
     if (user_exists(username)) {
         return false;
     }
@@ -155,7 +163,13 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
 
-    auto hashed_ip = hash_data(ip);
+    /**
+     * Accounts created offline (e.g. via --add-user) have no known IP yet.
+     * Storing NULL rather than a hash of "" means the first real login isn't
+     * treated as an unknown-IP login.
+     */
+    const bool has_ip = !ip.empty();
+    auto hashed_ip = has_ip ? hash_data(ip) : HashedPassword{};
 
     // SQLite Statement
     sqlite3_stmt* stmt = nullptr;
@@ -173,7 +187,12 @@ bool CredentialStore::add_user(const std::string& username, const std::string& p
     sqlite3_bind_text(stmt, 2, hashed.hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 3, hashed.iterations);
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(now));
-    sqlite3_bind_text(stmt, 5, hashed_ip.hash.c_str(), -1, SQLITE_STATIC);
+    if (has_ip) {
+        sqlite3_bind_text(stmt, 5, hashed_ip.hash.c_str(), -1, SQLITE_STATIC);
+    }
+    else {
+        sqlite3_bind_null(stmt, 5);
+    }
 
     bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt); // Construct the statement with the binds
@@ -201,6 +220,12 @@ bool CredentialStore::verify(const std::string& username, const std::string& pas
         return false;
     }
 
+    // Checked before anything expensive, so a guessing address stops costing us PBKDF2 runs
+    if (is_throttled(ip)) {
+        logger.warn("[AUTH] refusing login for " + username + " from " + ip + ": too many failed logins");
+        return false;
+    }
+
     try {
         sqlite3_stmt* stmt = nullptr;
         const char* sql = "SELECT hash, iterations, last_known_ip FROM users "
@@ -213,11 +238,8 @@ bool CredentialStore::verify(const std::string& username, const std::string& pas
 
         sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
 
-        auto hashed_ip = hash_data(ip);
-        bool unknown_ip{ false };
-
         bool user_found = false;
-        std::string stored_hash, salt;
+        std::string stored_hash, salt, stored_ip;
         int iterations = 100000;
 
         if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -233,11 +255,10 @@ bool CredentialStore::verify(const std::string& username, const std::string& pas
                 return false;
             }
 
-            if (ip_cstr && std::string(ip_cstr) != hashed_ip.hash) {
-                unknown_ip = true;
+            if (ip_cstr) {
+                stored_ip = ip_cstr;
             }
 
-            salt = derive_salt(username);
             stored_hash = hash_cstr;
             iterations = sqlite3_column_int(stmt, 1);
 
@@ -246,27 +267,79 @@ bool CredentialStore::verify(const std::string& username, const std::string& pas
 
         sqlite3_finalize(stmt);
 
-        // Constant-Time evaluation - timing attack prevention
-        std::string computed = pbkdf2(
-            passwd, salt.empty() ? "deadbeef" : salt,
-            iterations
-        );
+        /**
+         * Constant-Time evaluation - timing attack prevention.
+         * Unknown users get the same derived salt and the same PBKDF2 run. The old
+         * "deadbeef" stand-in was too short for pbkdf2(), which threw before hashing,
+         * so a missing account answered ~100x faster than a wrong password
+         */
+        salt = derive_salt(username);
+        std::string computed = pbkdf2(passwd, salt, iterations);
 
         const bool auth_ok = constant_time_eq(computed, stored_hash);
 
-        if (!user_found) {
+        if (!user_found || !auth_ok) {
+            record_failure(ip);
             return false;
         }
 
-        if (unknown_ip) {
+        // The IP hash is another full PBKDF2 run, so only a correct password earns it
+        if (!stored_ip.empty() && hash_data(ip).hash != stored_ip) {
             notify_unknown_ip(username, ip);
         }
 
-        return auth_ok;
+        return true;
     }
     catch (const std::exception& ex) {
         logger.error("[AUTH] verify() exception: " + std::string(ex.what()));
         return false;
+    }
+}
+
+bool CredentialStore::is_throttled(const std::string& ip) {
+    // Local webmail and proxies log in for every user from loopback, so one
+    // user's typos there must not lock everyone else out
+    if (ip == "127.0.0.1") {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(failures_mutex_);
+
+    auto itr = failures_.find(ip);
+    if (itr == failures_.end()) {
+        return false;
+    }
+
+    if (std::chrono::steady_clock::now() - itr->second.start >= AUTH_FAILURE_WINDOW) {
+        failures_.erase(itr);
+        return false;
+    }
+
+    return itr->second.count >= MAX_AUTH_FAILURES;
+}
+
+void CredentialStore::record_failure(const std::string& ip) {
+    if (ip == "127.0.0.1") {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(failures_mutex_);
+    auto now = std::chrono::steady_clock::now();
+
+    // Keep the table from growing forever under a spread-out attack
+    if (failures_.size() >= 4096) {
+        std::erase_if(failures_, [&now](const auto& entry) {
+            return now - entry.second.start >= AUTH_FAILURE_WINDOW;
+            });
+    }
+
+    auto& window = failures_[ip];
+    if (window.count == 0 || now - window.start >= AUTH_FAILURE_WINDOW) {
+        window = FailureWindow{ 0, now };
+    }
+
+    if (++window.count == MAX_AUTH_FAILURES) {
+        logger.warn("[AUTH] " + ip + " reached " + std::to_string(MAX_AUTH_FAILURES) + " failed logins, refusing it for the rest of the window");
     }
 }
 
@@ -432,6 +505,24 @@ bool CredentialStore::user_exists(const std::string& username) {
 
     if (sqlite3_prepare_v2(
         db_, "SELECT 1 FROM users WHERE username = ?",
+        -1, &stmt, nullptr
+    ) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool ok = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+
+    return ok;
+}
+
+bool CredentialStore::is_active_user(const std::string& username) {
+    sqlite3_stmt* stmt{ nullptr };
+
+    if (sqlite3_prepare_v2(
+        db_, "SELECT 1 FROM users WHERE username = ? AND active = 1",
         -1, &stmt, nullptr
     ) != SQLITE_OK) {
         return false;

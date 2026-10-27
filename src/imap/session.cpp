@@ -13,27 +13,93 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <tuple>
+#include <unordered_set>
 
 using namespace IMAP;
+
+std::mutex Session::uuid_map_mutex_;
 
 Session::Session(
     uint64_t conn_id, std::string remote_ip, Async::IoUringLoop& loop,
     Auth::CredentialStore& cred_store, const std::string& mail_root
 ) : conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), cred_store_(cred_store),
 mail_root_(mail_root) {
-    // Send greeting on connect
-    untagged("OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE] JAMS IMAP server ready");
+    // Send greeting on connect (on IMAPS this is held until the TLS handshake completes)
+    untagged("OK [CAPABILITY " + capabilities() + "] JAMS IMAP server ready");
+}
+
+bool Session::tls_secured() const {
+    return loop_.is_implicit_tls() || loop_.has_tls(conn_id_);
+}
+
+std::string Session::capabilities() const {
+    std::string caps = "IMAP4rev1";
+
+    if (tls_secured()) {
+        caps += " AUTH=PLAIN";
+    }
+    else {
+        // RFC 3501 sections 6.2.1 and 6.2.3
+        caps += " STARTTLS LOGINDISABLED";
+    }
+
+    caps += " LITERAL+ SASL-IR APPENDLIMIT=" + std::to_string(MAX_APPEND_SIZE);
+    return caps;
+}
+
+std::chrono::seconds Session::idle_timeout(std::chrono::seconds fallback) const {
+    if (state_ == State::NotAuthenticated) {
+        return fallback;
+    }
+
+    return std::chrono::seconds(get_limit("imap_idle_timeout", 1800));
+}
+
+bool Session::is_valid_mailbox_name(const std::string& mailbox) {
+    if (mailbox.empty() || mailbox.size() > 255) {
+        return false;
+    }
+
+    /**
+     * Mailbox names become a single Maildir++ directory (".Name"), so anything
+     * that could act as a path separator or dot segment is refused outright
+     * rather than sanitised.
+     */
+    if (mailbox.front() == '.' || mailbox.back() == '.' || mailbox.find("..") != std::string::npos) {
+        return false;
+    }
+
+    for (const char c : mailbox) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F || c == '/' || c == '\\' || c == '"') {
+            return false;
+        }
+    }
+
+    // Maildir's own subdirectories are never valid mailbox names
+    if (mailbox == "cur" || mailbox == "new" || mailbox == "tmp") {
+        return false;
+    }
+
+    return true;
+}
+
+std::string Session::mailbox_root(const std::string& mailbox) const {
+    std::string base = mail_root_ + "/" + username_;
+
+    // Subfolders are as per Maildir++ convention: .FolderName
+    if (mailbox != "INBOX") {
+        base += "/." + mailbox;
+    }
+
+    return base;
 }
 
 std::string Session::message_path(const MessageMeta& msg) const {
     std::string dir = msg.in_cur ? "/cur/" : "/new/";
-    std::string base = mail_root_ + "/" + username_;
 
-    if (selected_mailbox_ != "INBOX") {
-        base += "/." + selected_mailbox_;
-    }
-
-    return base + dir + msg.filename;
+    return mailbox_root(selected_mailbox_) + dir + msg.filename;
 }
 
 void Session::on_data(std::span<const uint8_t> bytes) {
@@ -66,6 +132,11 @@ void Session::on_data(std::span<const uint8_t> bytes) {
 
             if (tls_upgrade_pending_) {
                 tls_upgrade_pending_ = false;
+                return;
+            }
+
+            // Anything after LOGOUT, or after a refused LITERAL+ append, is not a command
+            if (state_ == State::Logout) {
                 return;
             }
 
@@ -159,6 +230,12 @@ void Session::process_line(const std::string& line) {
             return;
         }
 
+        if ((command == "LOGIN" || command == "AUTHENTICATE") && !tls_secured()) {
+            // Refuse before reading any credentials (RFC 3501 6.2.3, RFC 5530 PRIVACYREQUIRED)
+            no(tag, "[PRIVACYREQUIRED] Run STARTTLS before logging in");
+            return;
+        }
+
         if (command == "LOGIN") {
             cmd_login(tag, args);
             return;
@@ -235,7 +312,7 @@ void Session::process_line(const std::string& line) {
             std::transform(uid_cmd.begin(), uid_cmd.end(), uid_cmd.begin(), ::toupper);
 
             if (uid_cmd == "FETCH") {
-                cmd_fetch(tag, uid_args);
+                cmd_fetch(tag, uid_args, true);
                 return;
             }
             if (uid_cmd == "SEARCH") {
@@ -243,7 +320,7 @@ void Session::process_line(const std::string& line) {
                 return;
             }
             if (uid_cmd == "STORE") {
-                cmd_store(tag, uid_args);
+                cmd_store(tag, uid_args, true);
                 return;
             }
 
@@ -322,7 +399,7 @@ void Session::cmd_idle_done() {
 }
 
 void Session::cmd_capability(const std::string& tag) {
-    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR");
+    untagged("CAPABILITY " + capabilities());
 
     ok(tag, "CAPABILITY completed");
 }
@@ -346,6 +423,11 @@ void Session::cmd_logout(const std::string& tag) {
 void Session::cmd_starttls(const std::string& tag) {
     if (tls_upgrade_pending_) {
         bad(tag, "TLS already pending");
+        return;
+    }
+
+    if (tls_secured()) {
+        bad(tag, "TLS is already active");
         return;
     }
 
@@ -378,7 +460,7 @@ void Session::cmd_uid_search(const std::string& tag, const std::string& args) {
             time_t since_t = mktime(&tm);
 
             for (const auto& msg : messages_) {
-                if (static_cast<time_t>(msg.uuid) >= since_t) {
+                if (msg.internal_date >= since_t) {
                     results.push_back(msg.uuid);
                 }
             }
@@ -424,6 +506,18 @@ void Session::cmd_append(const std::string& tag, const std::string& args) {
         return;
     }
 
+    std::string u_mbox = mbox;
+    std::transform(u_mbox.begin(), u_mbox.end(), u_mbox.begin(), ::toupper);
+
+    if (u_mbox == "INBOX") {
+        mbox = "INBOX";
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[CANNOT] Invalid mailbox name");
+        return;
+    }
+
     // Skip optional flags
     std::string flags;
     auto trim_ws = [](const std::string& ws) {
@@ -456,25 +550,44 @@ void Session::cmd_append(const std::string& tag, const std::string& args) {
 
     size_t sz = 0;
     auto inner = rest.substr(1, rest.size() - 2);
+    bool non_synchronizing{ false };
 
     if (!inner.empty() && inner.back() == '+') {
         inner.pop_back();
+        non_synchronizing = true;
     }
 
     auto [ptr, ec] = std::from_chars(inner.data(), inner.data() + inner.size(), sz);
-    if (ec != std::errc{}) {
+    if (ec != std::errc{} || ptr != inner.data() + inner.size()) {
         bad(tag, "Bad literal size");
+        return;
+    }
+
+    if (sz == 0 || sz > MAX_APPEND_SIZE) {
+        /**
+         * A LITERAL+ client sends the message bytes without waiting for "+",
+         * so after refusing it the rest of the stream is message data, not
+         * commands. RFC 7888 section 4: reject with BAD and close the connection.
+         */
+        if (non_synchronizing) {
+            bad(tag, "[TOOBIG] Message size exceeds the APPENDLIMIT, closing connection");
+            state_ = State::Logout;
+            loop_.submit_close(conn_id_);
+            return;
+        }
+
+        no(tag, sz == 0 ? "Empty message" : "[TOOBIG] Message size exceeds the APPENDLIMIT");
         return;
     }
 
     ensure_mailbox_dirs(mbox);
 
-    // Arm literal reader
+    // Arm literal reader. The buffer grows as bytes arrive rather than
+    // reserving whatever size the client claimed up front.
     append_tag_ = tag;
     append_mailbox_ = mbox;
     append_flags_ = flags;
     literal_buf_.clear();
-    literal_buf_.reserve(sz);
     literal_remaining_ = sz;
     literal_pending_ = true;
 
@@ -487,8 +600,16 @@ void Session::cmd_create(const std::string& tag, const std::string& args) {
         mbox = mbox.substr(1, mbox.size() - 2);
     }
 
-    if (mbox.empty() || mbox == "INBOX") {
+    std::string u_mbox = mbox;
+    std::transform(u_mbox.begin(), u_mbox.end(), u_mbox.begin(), ::toupper);
+
+    if (mbox.empty() || u_mbox == "INBOX") {
         no(tag, "Cannot create that mailbox");
+        return;
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[CANNOT] Invalid mailbox name");
         return;
     }
 
@@ -530,12 +651,7 @@ void Session::complete_append() {
 
     ensure_mailbox_dirs(append_mailbox_);
 
-    std::string base = mail_root_ + "/" + username_;
-    if (append_mailbox_ != "INBOX") {
-        base += "/." + append_mailbox_;
-    }
-
-    std::string path = base + "/cur/" + fname;
+    std::string path = mailbox_root(append_mailbox_) + "/cur/" + fname;
     std::ofstream out(path, std::ios::binary);
 
     if (!out) {
@@ -561,10 +677,7 @@ void Session::complete_append() {
 }
 
 void Session::ensure_mailbox_dirs(const std::string& mailbox) {
-    std::string base = mail_root_ + "/" + username_;
-    if (mailbox != "INBOX") {
-        base += "/." + mailbox;
-    }
+    std::string base = mailbox_root(mailbox);
 
     // Sanity check to ensure the base dir is real
     ::mkdir(base.c_str(), 0700);
@@ -641,6 +754,11 @@ void Session::cmd_select(
         mbox = "INBOX";
     }
 
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[NONEXISTENT] Invalid mailbox name");
+        return;
+    }
+
     load_mailbox(mbox);
 
     selected_mailbox_ = mbox;
@@ -652,7 +770,7 @@ void Session::cmd_select(
     untagged("0 RECENT");
     untagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
     untagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)] Permanent flags");
-    untagged("OK [UIDVALIDITY " + std::to_string(IMAP_UUID_VALIDITY) + "] UIDs valid");
+    untagged("OK [UIDVALIDITY " + std::to_string(uuid_validity_) + "] UIDs valid");
     untagged("OK [UIDNEXT " + std::to_string(next_uuid_) + "] Next UID");
 
     if (read_only) {
@@ -768,7 +886,7 @@ void Session::cmd_status(const std::string& tag, const std::string& args) {
     ok(tag, "STATUS completed");
 }
 
-void Session::cmd_fetch(const std::string& tag, const std::string& args) {
+void Session::cmd_fetch(const std::string& tag, const std::string& args, bool by_uid) {
     // fetch teh sequence-set items:
     auto sp = args.find(' ');
     if (sp == std::string::npos) {
@@ -779,7 +897,12 @@ void Session::cmd_fetch(const std::string& tag, const std::string& args) {
     std::string seq_str = args.substr(0, sp);
     std::string items = args.substr(sp + 1);
 
-    auto seqs = parse_sequence_set(seq_str);
+    // A UID FETCH response always carries the UID, asked for or not (RFC 3501 6.4.8)
+    if (by_uid) {
+        items += " UID";
+    }
+
+    auto seqs = parse_sequence_set(seq_str, by_uid);
 
     for (uint32_t seq : seqs) {
         // Find the message by the sequence number
@@ -868,7 +991,7 @@ std::string Session::fetch_message(
 
     if (upper.find("INTERNALDATE") != std::string::npos) {
         // Format: "04-Jun-2026 09:49:10 +0000"
-        time_t t = static_cast<time_t>(msg.uuid);
+        time_t t = msg.internal_date;
         struct tm tm {};
         gmtime_r(&t, &tm);
         char buf[64];
@@ -882,13 +1005,7 @@ std::string Session::fetch_message(
 
 std::vector<uint8_t> Session::read_blob(const MessageMeta& msg) const {
     std::string dir = msg.in_cur ? "/cur/" : "/new/";
-    std::string base = mail_root_ + "/" + username_;
-
-    if (selected_mailbox_ != "INBOX") {
-        base += "/." + selected_mailbox_;
-    }
-
-    std::string path = base + dir + msg.filename;
+    std::string path = mailbox_root(selected_mailbox_) + dir + msg.filename;
     std::ifstream file(path, std::ios::binary);
 
     if (!file) {
@@ -910,45 +1027,7 @@ std::string Session::build_body(const MessageMeta& msg) const {
         + std::to_string(msg.size) + " NIL NIL NIL)";
 }
 
-void Session::persist_flags(MessageMeta& msg) {
-    auto flag_chars = [](const std::string& flags) {
-        // Maildir requires flag letters in ASCII order: D F R S T
-        std::string s;
-        if (flags.find("\\Draft") != std::string::npos)    s += 'D';
-        if (flags.find("\\Flagged") != std::string::npos)  s += 'F';
-        if (flags.find("\\Answered") != std::string::npos) s += 'R';
-        if (flags.find("\\Seen") != std::string::npos)     s += 'S';
-        if (flags.find("\\Deleted") != std::string::npos)  s += 'T';
-        return s;
-        };
-
-    std::string base = msg.filename;
-    auto colon = base.find(":2,");
-    if (colon != std::string::npos) {
-        base = base.substr(0, colon);
-    }
-
-    std::string new_name = base + ":2," + flag_chars(msg.flags);
-    if (new_name == msg.filename) {
-        return; // nothing changed
-    }
-
-    std::string old_path = message_path(msg);
-
-    MessageMeta renamed = msg;
-    renamed.filename = new_name;
-    std::string new_path = message_path(renamed);
-
-    if (::rename(old_path.c_str(), new_path.c_str()) == 0) {
-        msg.filename = new_name;
-    }
-    else {
-        logger.error("[IMAP] persist_flags rename failed: " + old_path
-            + " -> " + new_path + " (" + std::strerror(errno) + ")");
-    }
-}
-
-void Session::cmd_store(const std::string& tag, const std::string& args) {
+void Session::cmd_store(const std::string& tag, const std::string& args, bool by_uid) {
     if (read_only_) {
         no(tag, "[READ-ONLY] Mailbox is read-only");
         return;
@@ -975,7 +1054,7 @@ void Session::cmd_store(const std::string& tag, const std::string& args) {
     std::string upper = action;
     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
-    auto seqs = parse_sequence_set(seq_str);
+    auto seqs = parse_sequence_set(seq_str, by_uid);
 
     for (uint32_t seq : seqs) {
         auto itr = std::find_if(
@@ -1008,7 +1087,8 @@ void Session::cmd_store(const std::string& tag, const std::string& args) {
 
         // Send FETCH unless .SILENT is present
         if (upper.find(".SILENT") == std::string::npos) {
-            untagged(std::to_string(seq) + " FETCH (FLAGS (" + itr->flags + "))");
+            untagged(std::to_string(seq) + " FETCH (FLAGS (" + itr->flags + ")"
+                + (by_uid ? " UID " + std::to_string(itr->uuid) : "") + ")");
         }
     }
 
@@ -1148,15 +1228,14 @@ void Session::complete_plain_auth(const std::string& tag, const std::string& b64
 }
 
 void Session::load_mailbox(const std::string& mailbox) {
+    // Held from the directory scan to the uidlist write, so a message moving
+    // from new/ to cur/ on another thread can't slip between the two
+    std::lock_guard<std::mutex> lock(uuid_map_mutex_);
+
     messages_.clear();
     next_uuid_ = 1;
 
-    std::string base = mail_root_ + "/" + username_;
-    if (mailbox != "INBOX") {
-        // Subfolders are as per Maildir++ convention:
-        // .FolderName
-        base += "/." + mailbox;
-    }
+    std::string base = mailbox_root(mailbox);
 
     uint32_t seq = 0;
 
@@ -1187,7 +1266,8 @@ void Session::load_mailbox(const std::string& mailbox) {
             }
 
             MessageMeta meta;
-            meta.uuid = uuid_from_file(fname);
+            meta.uuid = 0; // assigned from jams-uidlist below
+            meta.internal_date = date_from_file(fname);
             meta.seq = ++seq;
             meta.filename = fname;
             meta.flags = flags_from_file(fname);
@@ -1200,18 +1280,7 @@ void Session::load_mailbox(const std::string& mailbox) {
         ::closedir(d);
     }
 
-    // Sort by UUID for stable ordering
-    std::sort(
-        messages_.begin(), messages_.end(),
-        [](const MessageMeta& a, const MessageMeta& b) {
-            return a.uuid < b.uuid;
-        });
-
-    // reassign sequences after sort
-    for (uint32_t i = 0; i < messages_.size(); i++) {
-        messages_[i].seq = i + 1;
-        next_uuid_ = std::max(next_uuid_, messages_[i].uuid + 1);
-    }
+    assign_uuids(mailbox);
 
     logger.info("[IMAP] " + std::to_string(conn_id_) + " loaded " + std::to_string(messages_.size()) + " messages from " + mailbox);
 }
@@ -1237,13 +1306,37 @@ size_t Session::scan_new() const {
 }
 
 void Session::incorporate_new() {
-    std::string new_dir = mail_root_ + "/" + username_ + "/new";
-    std::string cur_dir = mail_root_ + "/" + username_ + "/cur";
+    // New mail lands in the selected mailbox's new/, which isn't always INBOX's
+    std::string root = mailbox_root(selected_mailbox_);
+    std::string new_dir = root + "/new";
+    std::string cur_dir = root + "/cur";
 
     DIR* d = ::opendir(new_dir.c_str());
     if (!d) {
         return;
     }
+
+    std::lock_guard<std::mutex> lock(uuid_map_mutex_);
+
+    // Re-read the map, another session may have handed out UIDs since we loaded ours
+    uint32_t validity = uuid_validity_;
+    uint32_t next = next_uuid_;
+    std::unordered_map<std::string, uint32_t> known;
+    {
+        uint32_t file_validity = 0;
+        uint32_t file_next = 1;
+
+        if (read_uuid_map(selected_mailbox_, file_validity, file_next, known)) {
+            validity = file_validity;
+            next = std::max(next, file_next);
+        }
+    }
+
+    for (const auto& msg : messages_) {
+        known.emplace(base_name(msg.filename), msg.uuid);
+    }
+
+    std::vector<MessageMeta> arrived;
 
     struct dirent* ent;
     while ((ent = ::readdir(d)) != nullptr) {
@@ -1263,38 +1356,245 @@ void Session::incorporate_new() {
         std::string dst = cur_dir + "/" + dst_name;
 
         if (::rename(src.c_str(), dst.c_str()) == 0) {
+            std::string base = base_name(dst_name);
+
+            // Already loaded from new/ by SELECT, so just follow the file to cur/
+            auto existing = std::find_if(
+                messages_.begin(), messages_.end(),
+                [&base](const MessageMeta& m) {
+                    return base_name(m.filename) == base;
+                });
+
+            if (existing != messages_.end()) {
+                existing->filename = dst_name;
+                existing->in_cur = true;
+                continue;
+            }
+
             struct stat st {};
 
             if (::stat(dst.c_str(), &st) == 0) {
                 MessageMeta meta;
-                meta.uuid = uuid_from_file(dst_name);
-                meta.seq = static_cast<uint32_t>(messages_.size()) + 1;
+                auto itr = known.find(base);
+                meta.uuid = (itr != known.end()) ? itr->second : 0;
+                meta.internal_date = date_from_file(dst_name);
                 meta.filename = dst_name;
                 meta.size = static_cast<size_t>(st.st_size);
                 meta.in_cur = true;
                 meta.flags = "";
 
-                messages_.push_back(std::move(meta));
-                next_uuid_ = std::max(next_uuid_, meta.uuid + 1);
+                arrived.push_back(std::move(meta));
             }
         }
     }
 
     ::closedir(d);
-}
 
-uint32_t Session::uuid_from_file(const std::string& filename) {
-    // Maildir conventions start with a UNIX timestamp, PID, then host
-    // We'll be using the timestamp as the UUID
-    auto dot = filename.find_first_of('.');
-    if (dot == std::string::npos) {
-        return 1;
+    if (arrived.empty()) {
+        return;
     }
 
-    uint32_t uuid = 0;
-    auto [ptr, ec] = std::from_chars(filename.data(), filename.data() + dot, uuid);
+    // New UIDs go out in arrival order, above every UID handed out before
+    std::sort(
+        arrived.begin(), arrived.end(),
+        [](const MessageMeta& a, const MessageMeta& b) {
+            return std::tie(a.internal_date, a.filename) < std::tie(b.internal_date, b.filename);
+        });
 
-    return (ec == std::errc{}) ? uuid : 1;
+    for (auto& meta : arrived) {
+        if (meta.uuid == 0) {
+            meta.uuid = next++;
+        }
+    }
+
+    std::sort(
+        arrived.begin(), arrived.end(),
+        [](const MessageMeta& a, const MessageMeta& b) {
+            return a.uuid < b.uuid;
+        });
+
+    for (auto& meta : arrived) {
+        meta.seq = static_cast<uint32_t>(messages_.size()) + 1;
+        known[base_name(meta.filename)] = meta.uuid;
+        messages_.push_back(std::move(meta));
+    }
+
+    next_uuid_ = next;
+    write_uuid_map(selected_mailbox_, validity, next, known);
+}
+
+void Session::assign_uuids(const std::string& mailbox) {
+    uint32_t validity = 0;
+    uint32_t next = 1;
+    std::unordered_map<std::string, uint32_t> known;
+
+    bool dirty = !read_uuid_map(mailbox, validity, next, known);
+    if (dirty) {
+        // First time this mailbox is opened, or its map was lost: start a new UID epoch.
+        // A fresh UIDVALIDITY tells clients to throw away any UIDs they cached before
+        validity = std::max<uint32_t>(1, static_cast<uint32_t>(std::time(nullptr)));
+        next = 1;
+        known.clear();
+    }
+
+    std::unordered_set<uint32_t> taken;
+    std::vector<MessageMeta*> fresh;
+
+    for (auto& msg : messages_) {
+        auto itr = known.find(base_name(msg.filename));
+
+        if (itr != known.end() && taken.insert(itr->second).second) {
+            msg.uuid = itr->second;
+        }
+        else {
+            fresh.push_back(&msg);
+        }
+    }
+
+    // New UIDs go out in arrival order, above every UID handed out before
+    std::sort(
+        fresh.begin(), fresh.end(),
+        [](const MessageMeta* a, const MessageMeta* b) {
+            return std::tie(a->internal_date, a->filename) < std::tie(b->internal_date, b->filename);
+        });
+
+    for (auto* msg : fresh) {
+        msg->uuid = next++;
+    }
+
+    // Sequence numbers follow UID order
+    std::sort(
+        messages_.begin(), messages_.end(),
+        [](const MessageMeta& a, const MessageMeta& b) {
+            return a.uuid < b.uuid;
+        });
+
+    for (uint32_t i = 0; i < messages_.size(); i++) {
+        messages_[i].seq = i + 1;
+    }
+
+    uuid_validity_ = validity;
+    next_uuid_ = next;
+
+    // Rewrite when something was assigned, or an expunged message's entry can be dropped
+    if (!dirty && fresh.empty() && known.size() == messages_.size()) {
+        return;
+    }
+
+    // SELECT doesn't require the mailbox to exist, so don't create one by writing into it
+    struct stat st {};
+    if (::stat(mailbox_root(mailbox).c_str(), &st) != 0) {
+        return;
+    }
+
+    std::unordered_map<std::string, uint32_t> current;
+    for (const auto& msg : messages_) {
+        current[base_name(msg.filename)] = msg.uuid;
+    }
+
+    write_uuid_map(mailbox, validity, next, current);
+}
+
+bool Session::read_uuid_map(
+    const std::string& mailbox, uint32_t& validity, uint32_t& next,
+    std::unordered_map<std::string, uint32_t>& uuids
+) const {
+    std::ifstream in(mailbox_root(mailbox) + "/" + UUID_MAP_FILE, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+
+    // Header: JAMS-UIDLIST <version> <uidvalidity> <uidnext>
+    std::string line;
+    std::getline(in, line);
+    std::istringstream header(line);
+    std::string magic;
+    int version = 0;
+
+    if (
+        !(header >> magic >> version >> validity >> next)
+        || magic != "JAMS-UIDLIST" || version != 1
+        || validity == 0 || next == 0
+        ) {
+        return false;
+    }
+
+    // One "<uid> <base name>" per line
+    while (std::getline(in, line)) {
+        auto sp = line.find(' ');
+        if (sp == std::string::npos || sp + 1 == line.size()) {
+            continue;
+        }
+
+        uint32_t uuid = 0;
+        auto [ptr, ec] = std::from_chars(line.data(), line.data() + sp, uuid);
+        if (ec != std::errc{} || ptr != line.data() + sp || uuid == 0 || uuid == UINT32_MAX) {
+            continue;
+        }
+
+        uuids[line.substr(sp + 1)] = uuid;
+        next = std::max(next, uuid + 1);
+    }
+
+    return true;
+}
+
+void Session::write_uuid_map(
+    const std::string& mailbox, uint32_t validity, uint32_t next,
+    const std::unordered_map<std::string, uint32_t>& uuids
+) const {
+    std::string path = mailbox_root(mailbox) + "/" + UUID_MAP_FILE;
+    std::string tmp = path + ".tmp";
+
+    std::vector<std::pair<uint32_t, std::string>> rows;
+    rows.reserve(uuids.size());
+
+    for (const auto& [name, uuid] : uuids) {
+        if (name.find('\n') == std::string::npos) {
+            rows.emplace_back(uuid, name);
+        }
+    }
+
+    std::sort(rows.begin(), rows.end());
+
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out << "JAMS-UIDLIST 1 " << validity << ' ' << next << '\n';
+
+        for (const auto& [uuid, name] : rows) {
+            out << uuid << ' ' << name << '\n';
+        }
+
+        out.flush();
+        if (!out) {
+            logger.error("[IMAP] Failed to write " + tmp + " errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")");
+            ::unlink(tmp.c_str());
+            return;
+        }
+    }
+
+    // rename() swaps the file in atomically, so a crash never leaves half a map behind
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        logger.error("[IMAP] Failed to replace " + path + " errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")");
+        ::unlink(tmp.c_str());
+    }
+}
+
+std::string Session::base_name(const std::string& filename) {
+    return filename.substr(0, filename.find(":2,"));
+}
+
+time_t Session::date_from_file(const std::string& filename) {
+    // Maildir conventions start with a UNIX timestamp, PID, then host
+    auto dot = filename.find_first_of('.');
+    if (dot == std::string::npos) {
+        return 0;
+    }
+
+    long long secs = 0;
+    auto [ptr, ec] = std::from_chars(filename.data(), filename.data() + dot, secs);
+
+    return (ec == std::errc{}) ? static_cast<time_t>(secs) : 0;
 }
 
 std::string Session::flags_from_file(const std::string& filename) {
@@ -1336,52 +1636,61 @@ std::string Session::flags_from_file(const std::string& filename) {
 }
 
 std::vector<uint32_t> Session::parse_sequence_set(
-    const std::string& set
+    const std::string& set, bool by_uid
 ) const {
     std::vector<uint32_t> result;
-    uint32_t max_seq = static_cast<uint32_t>(messages_.size());
 
-    if (max_seq == 0) {
+    if (messages_.empty()) {
         return result;
     }
+
+    // '*' is the highest number in use: the message count, or the last message's UID
+    uint32_t max_num = by_uid
+        ? messages_.back().uuid
+        : static_cast<uint32_t>(messages_.size());
+
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
 
     // Split on ','
     std::istringstream ss(set);
     std::string range;
 
     while (std::getline(ss, range, ',')) {
-        auto colon = range.find(':');
-
         auto parse_num = [&](const std::string& s) -> uint32_t {
             if (s == "*") {
-                return max_seq;
+                return max_num;
             }
 
             uint32_t n = 0;
-            std::from_chars(s.data(), s.data() + s.size(), n);
+            auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
 
-            return std::min(n, max_seq);
+            return (ec == std::errc{} && ptr == s.data() + s.size()) ? n : 0;
             };
 
-        if (colon == std::string::npos) {
-            uint32_t n = parse_num(range);
+        auto colon = range.find(':');
+        uint32_t lo = parse_num(range.substr(0, colon));
+        uint32_t hi = (colon == std::string::npos) ? lo : parse_num(range.substr(colon + 1));
 
-            if (n >= 1 && n <= max_seq) {
-                result.push_back(n);
-            }
+        if (lo == 0 || hi == 0) {
+            continue; // 0 and junk never name a message
         }
-        else {
-            uint32_t lo = parse_num(range.substr(0, colon));
-            uint32_t hi = parse_num(range.substr(colon + 1));
 
-            if (lo > hi) {
-                std::swap(lo, hi);
-            }
+        if (lo > hi) {
+            std::swap(lo, hi);
+        }
 
-            for (uint32_t i = lo; i <= hi; ++i) {
-                if (i >= 1 && i <= max_seq) {
-                    result.push_back(i);
-                }
+        ranges.emplace_back(lo, hi);
+    }
+
+    // Walk the mailbox rather than the range, so 1:4294967295 is one pass.
+    // A number with no message behind it matches nothing, it is never clamped onto the last one
+    for (const auto& msg : messages_) {
+        uint32_t num = by_uid ? msg.uuid : msg.seq;
+
+        for (const auto& [lo, hi] : ranges) {
+            if (num >= lo && num <= hi) {
+                result.push_back(msg.seq);
+                break;
             }
         }
     }

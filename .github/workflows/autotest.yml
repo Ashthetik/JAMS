@@ -53,6 +53,7 @@ jobs:
                   JAMS_BIN: ${{github.workspace}}/build/mailserver
                   JAMS_CONFIG: /tmp/jams/config/server.toml
                   JAMS_LOG_PATH: /tmp/jams/logs/jams.txt
+                  JAMS_PEPPER: ci-test-pepper-not-a-secret
               run: |
                 echo "--- contents of tests/integration ---"
                 find tests/integration -type f 2>&1 || echo "directory does not exist"
@@ -64,6 +65,7 @@ jobs:
                   JAMS_BIN: ${{github.workspace}}/build/mailserver
                   JAMS_CONFIG: /tmp/jams/config/server.toml
                   JAMS_LOG_PATH: /tmp/jams/logs/jams.txt
+                  JAMS_PEPPER: ci-test-pepper-not-a-secret
               run: python3 -m pytest tests/integration -v --tb=short
             
             - name: Upload server logs on failure

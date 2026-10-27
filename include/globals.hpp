@@ -55,6 +55,25 @@ inline std::string get_mailroot() {
     return result;
 }
 
+/// @brief Reads a positive number from the optional [limits] table
+/// @param key 
+/// @param fallback Used when the key is missing or not a positive number
+/// @return 
+inline uint32_t get_limit(const std::string& key, uint32_t fallback) {
+    auto itr = configs.find(key);
+    if (itr == configs.end()) {
+        return fallback;
+    }
+
+    try {
+        auto value = std::stoul(itr->second);
+        return (value > 0 && value <= UINT32_MAX) ? static_cast<uint32_t>(value) : fallback;
+    }
+    catch (const std::exception&) {
+        return fallback;
+    }
+}
+
 inline std::string get_db_path() {
     std::string result{};
 
