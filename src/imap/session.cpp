@@ -104,6 +104,11 @@ void Session::on_data(std::span<const uint8_t> bytes) {
                 return;
             }
 
+            // Anything after LOGOUT, or after a refused LITERAL+ append, is not a command
+            if (state_ == State::Logout) {
+                return;
+            }
+
             // Drain any literal bytes that arrived in the same call
             if (literal_pending_ && literal_remaining_ > 0) {
                 size_t avail = bytes.size() - (i + 1);
@@ -303,7 +308,7 @@ void Session::process_line(const std::string& line) {
 }
 
 void Session::cmd_capability(const std::string& tag) {
-    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR");
+    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR APPENDLIMIT=" + std::to_string(MAX_APPEND_SIZE));
 
     ok(tag, "CAPABILITY completed");
 }
@@ -449,25 +454,44 @@ void Session::cmd_append(const std::string& tag, const std::string& args) {
 
     size_t sz = 0;
     auto inner = rest.substr(1, rest.size() - 2);
+    bool non_synchronizing{ false };
 
     if (!inner.empty() && inner.back() == '+') {
         inner.pop_back();
+        non_synchronizing = true;
     }
 
     auto [ptr, ec] = std::from_chars(inner.data(), inner.data() + inner.size(), sz);
-    if (ec != std::errc{}) {
+    if (ec != std::errc{} || ptr != inner.data() + inner.size()) {
         bad(tag, "Bad literal size");
+        return;
+    }
+
+    if (sz == 0 || sz > MAX_APPEND_SIZE) {
+        /**
+         * A LITERAL+ client sends the message bytes without waiting for "+",
+         * so after refusing it the rest of the stream is message data, not
+         * commands. RFC 7888 section 4: reject with BAD and close the connection.
+         */
+        if (non_synchronizing) {
+            bad(tag, "[TOOBIG] Message size exceeds the APPENDLIMIT, closing connection");
+            state_ = State::Logout;
+            loop_.submit_close(conn_id_);
+            return;
+        }
+
+        no(tag, sz == 0 ? "Empty message" : "[TOOBIG] Message size exceeds the APPENDLIMIT");
         return;
     }
 
     ensure_mailbox_dirs(mbox);
 
-    // Arm literal reader
+    // Arm literal reader. The buffer grows as bytes arrive rather than
+    // reserving whatever size the client claimed up front.
     append_tag_ = tag;
     append_mailbox_ = mbox;
     append_flags_ = flags;
     literal_buf_.clear();
-    literal_buf_.reserve(sz);
     literal_remaining_ = sz;
     literal_pending_ = true;
 

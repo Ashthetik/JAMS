@@ -212,6 +212,9 @@ namespace IMAP {
         /// @brief "JAMS" in hexadecimal
         static constexpr uint32_t IMAP_UUID_VALIDITY = 0x4A414D53;
 
+        /// @brief Largest message APPEND will accept, matching the SMTP SIZE limit (RFC 7889 APPENDLIMIT)
+        static constexpr size_t MAX_APPEND_SIZE = 52428800;
+
         uint64_t conn_id_;
         std::string remote_ip_;
         Async::IoUringLoop& loop_;

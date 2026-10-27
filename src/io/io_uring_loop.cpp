@@ -273,7 +273,14 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     buf.read_buf.resize(READ_BUF_SIZE);
 
     // queue the 220 Banner (making the session available)
-    sessions_[cid] = session_factory_(cid, ip_buf, *this);
+    try {
+        sessions_[cid] = session_factory_(cid, ip_buf, *this);
+    }
+    catch (const std::exception& ex) {
+        logger.error("[ACCEPT] conn=" + std::to_string(cid) + " session setup failed:\n\t" + std::string(ex.what()));
+        submit_close(cid);
+        return;
+    }
 
     // Arming connection reads
     io_uring_sqe* sqe = get_sqe();
@@ -329,7 +336,20 @@ void Async::IoUringLoop::on_read(uint64_t conn_id, int res) {
 
     }
     else {
-        sit->second->on_data(data);
+        /**
+         * A session must never be able to take the whole listener down. An
+         * exception escaping here would unwind out of run() and stop every
+         * service, so contain it to this one connection, the same way the
+         * TLS path above already does.
+         */
+        try {
+            sit->second->on_data(data);
+        }
+        catch (const std::exception& ex) {
+            logger.error("[SESSION] conn=" + std::to_string(conn_id) + " error, closing connection:\n\t" + std::string(ex.what()));
+            submit_close(conn_id);
+            return;
+        }
     }
 
     /// relookup in case of old data
