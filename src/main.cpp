@@ -203,8 +203,8 @@ int main(int argc, char* argv[]) {
 
     std::thread smtp_thread([&]() {
         try {
-            Async::IoUringLoop smtp_loop(cfg.smtp_port, [&aliases](uint64_t id, const std::string& ip, Async::IoUringLoop& loop) {
-                return std::make_unique<SMTP::Session>(id, ip, loop, aliases);
+            Async::IoUringLoop smtp_loop(cfg.smtp_port, [&cred_store, &aliases](uint64_t id, const std::string& ip, Async::IoUringLoop& loop) {
+                return std::make_unique<SMTP::Session>(id, ip, loop, cred_store, aliases);
                 });
 
             smtp_loop.arm_periodic_timer(std::chrono::seconds(60), [&aliases]() {
