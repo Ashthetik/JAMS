@@ -537,8 +537,18 @@ void SubmissionServer::cmd_rcpt(std::string_view arg) {
         return;
     }
 
-    if (domain != get_hostname()) {
-        reply(550, "5.7.1 Relaying denied");
+    std::string local_domain = get_hostname();
+    std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
+
+    /**
+     * This is the submission port: RCPT is only reachable after AUTH and MAIL,
+     * so external recipients are what it exists for (RFC 6409). Relaying is
+     * blocked on port 25 instead, where senders are not authenticated.
+     */
+    if (domain_lower != local_domain) {
+        env_.rcpt_to.push_back(addr);
+        state_ = State::Rcpt;
+        reply(250, "OK");
         return;
     }
 
@@ -597,7 +607,8 @@ void SubmissionServer::cmd_quit() {
 bool SubmissionServer::deliver() {
     // TODO: Encrypt before writing
     bool all_ok = true;
-    const std::string local_domain = get_hostname();
+    std::string local_domain = get_hostname();
+    std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
     std::vector<std::string> all_rcpts = env_.rcpt_to;
 
     for (const auto& hdr : { "cc", "bcc" }) {
@@ -610,7 +621,7 @@ bool SubmissionServer::deliver() {
             std::string domain = addr.substr(at + 1);
             std::transform(domain.begin(), domain.end(), domain.begin(), ::tolower);
 
-            if (domain.empty() || domain != get_hostname()) {
+            if (domain.empty() || domain != local_domain) {
                 continue;
             }
 
@@ -635,7 +646,10 @@ bool SubmissionServer::deliver() {
             continue;
         }
 
-        if (domain.empty() || domain == get_hostname()) {
+        std::string domain_lower = domain;
+        std::transform(domain_lower.begin(), domain_lower.end(), domain_lower.begin(), ::tolower);
+
+        if (domain.empty() || domain_lower == local_domain) {
 
             std::string target = aliases_.resolve(rcpt);
             std::string mailbox_user = target;
@@ -695,12 +709,23 @@ bool SubmissionServer::relay_outbound(
     const std::string& domain, const std::string& body
 ) {
     // MX lookup
-    unsigned char answer[4096];
+    unsigned char answer[4096]{};
     int len = res_query(domain.c_str(), C_IN, T_MX, answer, sizeof(answer));
 
     if (len < 0) {
-        logger.error("[RELAY] MX Lookup failed for: " + domain);
-        return false;
+        /**
+         * RFC 5321 5.1: a domain that exists but has no MX records is treated
+         * as having an implicit MX pointing at the domain itself. res_query
+         * reports that case as an error (NO_DATA), so map it to an empty,
+         * zeroed answer and let the fallback below pick the domain's address.
+         */
+        if (h_errno != NO_DATA) {
+            logger.error("[RELAY] MX Lookup failed for: " + domain);
+            return false;
+        }
+
+        logger.info("[RELAY] No MX records for " + domain + ", using implicit MX");
+        len = sizeof(HEADER);
     }
 
     HEADER* header = reinterpret_cast<HEADER*>(answer);
