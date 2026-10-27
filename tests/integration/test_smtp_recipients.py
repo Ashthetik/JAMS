@@ -1,5 +1,5 @@
 # tests/integration/test_smtp_recipients.py
-import socket, os, glob
+import socket, ssl, os
 
 SMTP_PORT = 2525
 MAILROOT = "/tmp/jams/mail"
@@ -24,12 +24,40 @@ def deliver(rcpt, body):
         s.sendall(f"Subject: recipients test\r\n\r\n{body}\r\n.\r\n".encode())
         return b"250" in s.recv(1024)
 
-def mailbox_contains(user, marker):
-    for path in glob.glob(os.path.join(MAILROOT, user, "new", "*")) + glob.glob(os.path.join(MAILROOT, user, "cur", "*")):
-        with open(path, errors="ignore") as f:
-            if marker in f.read():
-                return True
-    return False
+def recv_until(s, marker, timeout=5):
+    s.settimeout(timeout)
+    data = b""
+    try:
+        while marker not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, ssl.SSLError):
+        pass
+    return data
+
+def inbox_contains(marker):
+    # Check through IMAP the way a user would. In CI the server runs as root and
+    # Maildirs are 0700, so the test process can't read them off disk directly.
+    raw = socket.create_connection(("127.0.0.1", 2143), timeout=5)
+    raw.recv(1024)
+    raw.sendall(b"t1 STARTTLS\r\n")
+    recv_until(raw, b"t1 ")
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    with ctx.wrap_socket(raw, server_hostname="localhost") as s:
+        s.sendall(b"a1 LOGIN ci-test-user ci-test-password\r\n")
+        assert b"a1 OK" in recv_until(s, b"a1 "), "test user could not log in to check its inbox"
+
+        s.sendall(b"a2 SELECT INBOX\r\n")
+        recv_until(s, b"a2 ")
+
+        s.sendall(b"a3 FETCH 1:* BODY[]\r\n")
+        return marker.encode() in recv_until(s, b"a3 ")
 
 def test_foreign_domain_is_relaying_denied(jams_server):
     reply = rcpt_reply("ci-test-user@gmail.com")
@@ -38,7 +66,7 @@ def test_foreign_domain_is_relaying_denied(jams_server):
 def test_foreign_domain_not_delivered_by_local_part(jams_server):
     # bob@gmail.com must never land in local bob's inbox
     assert not deliver("ci-test-user@gmail.com", "should-not-arrive-foreign")
-    assert not mailbox_contains("ci-test-user", "should-not-arrive-foreign")
+    assert not inbox_contains("should-not-arrive-foreign")
 
 def test_unknown_local_user_is_refused(jams_server):
     reply = rcpt_reply("no-such-user-42@test.local")
@@ -47,7 +75,7 @@ def test_unknown_local_user_is_refused(jams_server):
 
 def test_known_user_still_receives(jams_server):
     assert deliver("ci-test-user@test.local", "known-user-delivery-marker")
-    assert mailbox_contains("ci-test-user", "known-user-delivery-marker")
+    assert inbox_contains("known-user-delivery-marker")
 
 def test_domain_match_is_case_insensitive(jams_server):
     assert rcpt_reply("ci-test-user@TEST.Local").startswith(b"250")
