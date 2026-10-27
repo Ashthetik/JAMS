@@ -687,3 +687,11 @@ io_uring_sqe* Async::IoUringLoop::get_sqe() {
 void Async::IoUringLoop::submit() {
     io_uring_submit(&ring_);
 }
+
+void Async::IoUringLoop::register_idle_session(uint64_t conn_id, const std::string& username, const std::string& mailbox) {
+
+}
+
+void Async::IoUringLoop::unregister_idle_session(uint64_t conn_id) {
+    
+}
