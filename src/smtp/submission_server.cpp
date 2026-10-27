@@ -6,6 +6,7 @@
 
 #include <cctype>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <resolv.h>
 #include <netinet/in.h>
@@ -177,10 +178,11 @@ auto SubmissionServer::strip_header(const std::string& body, const std::string& 
         }
 
         if (stripped.empty()) {
-            skipping = false;
+            // End of the header block: the body is copied byte for byte, never filtered
             result += line + "\n";
+            result.append(std::istreambuf_iterator<char>(ss), std::istreambuf_iterator<char>());
 
-            continue;
+            return result;
         }
 
         std::string lower{ stripped };
@@ -665,7 +667,8 @@ bool SubmissionServer::deliver() {
             }
 
             Storage::MailDir mdir(target_path);
-            auto stored_path = mdir.deliver(env_.mail_from, rcpt, env_.body);
+            // Recipients must never see the Bcc list (RFC 5322 3.6.3)
+            auto stored_path = mdir.deliver(env_.mail_from, rcpt, outbound_body);
 
             if (!stored_path) {
                 logger.error("[DELIVER] Failed for: " + rcpt);
@@ -677,7 +680,7 @@ bool SubmissionServer::deliver() {
             }
         }
         else {
-            if (!relay_outbound(env_.mail_from, rcpt, domain, env_.body)) {
+            if (!relay_outbound(env_.mail_from, rcpt, domain, outbound_body)) {
                 logger.error("[DELIVER] Relay failed for: " + rcpt);
                 all_ok = false;
             }
@@ -1024,32 +1027,9 @@ bool SubmissionServer::relay_outbound(
     std::string outbound = body;
 
     if (ok) {
-        std::string msg_headers;
-        std::string msg_body;
-
-        auto sep = body.find("\r\n\r\n");
-        if (sep != std::string::npos) {
-            msg_headers = body.substr(0, sep + 2);
-            msg_body = body.substr(sep + 4);
-        }
-        else {
-            sep = body.find("\n\n");
-            if (sep != std::string::npos) {
-                msg_headers = body.substr(0, sep + 1);
-                msg_body = body.substr(sep + 2);
-            }
-            else {
-                logger.error("[RELAY] No header/body separator found in message - malformed");
-                return false;
-            }
-        }
-
         try {
-            logger.debug("[RELAY] Outbound headers:\n" + msg_headers);
-            outbound = dkim_signer_.sign(msg_headers, msg_body);
+            outbound = dkim_signer_.sign_message(body);
             logger.debug("[RELAY] Signed message:\n" + outbound);
-
-            outbound += "\r\n" + msg_body;
         }
         catch (const std::exception& e) {
             logger.error("[OUTBOUND_RELAY] DKIM Signing failed: " + std::string(e.what()));
