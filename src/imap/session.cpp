@@ -933,7 +933,7 @@ void Session::cmd_fetch(const std::string& tag, const std::string& args, bool by
             }
         }
 
-        std::string response = fetch_message(*itr, items);
+        response = fetch_message(*itr, items);
         untagged(response);
     }
 
@@ -1718,4 +1718,42 @@ void Session::bad(const std::string& tag, const std::string& msg) {
 
 void Session::untagged(const std::string& data) {
     send("* " + data);
+}
+
+void Session::persist_flags(MessageMeta& msg) {
+    auto flag_chars = [](const std::string& flags) {
+        // Maildir requires flag letters in ASCII order: D F R S T
+        std::string s;
+        if (flags.find("\\Draft") != std::string::npos)    s += 'D';
+        if (flags.find("\\Flagged") != std::string::npos)  s += 'F';
+        if (flags.find("\\Answered") != std::string::npos) s += 'R';
+        if (flags.find("\\Seen") != std::string::npos)     s += 'S';
+        if (flags.find("\\Deleted") != std::string::npos)  s += 'T';
+        return s;
+        };
+
+    std::string base = msg.filename;
+    auto colon = base.find(":2,");
+    if (colon != std::string::npos) {
+        base = base.substr(0, colon);
+    }
+
+    std::string new_name = base + ":2," + flag_chars(msg.flags);
+    if (new_name == msg.filename) {
+        return; // nothing changed
+    }
+
+    std::string old_path = message_path(msg);
+
+    MessageMeta renamed = msg;
+    renamed.filename = new_name;
+    std::string new_path = message_path(renamed);
+
+    if (::rename(old_path.c_str(), new_path.c_str()) == 0) {
+        msg.filename = new_name;
+    }
+    else {
+        logger.error("[IMAP] persist_flags rename failed: " + old_path
+            + " -> " + new_path + " (" + std::strerror(errno) + ")");
+    }
 }

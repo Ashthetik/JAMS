@@ -5,7 +5,6 @@
 #include <csignal>
 
 extern volatile sig_atomic_t g_shutdown;
-static std::vector<std::thread> threads = {};
 
 inline std::string resolve_path(const char* env, const char* fallback) {
     if (const char* env_ = std::getenv(env)) {
@@ -84,18 +83,4 @@ inline std::string get_db_path() {
     }
 
     return result;
-}
-
-
-/**
- * JAMS Start-Up Banner
- */
-void banner() {
-    std::cout
-        << "┌─────────────────────────────────────────┐\n"
-        << "│   JAMS — Just Another Mail Server       │\n"
-        << "│   version " << JAMS_VERSION
-        << "                   │\n"
-        << "│   github.com/DeTraced-Security/JAMS     │\n"
-        << "└─────────────────────────────────────────┘\n";
 }
