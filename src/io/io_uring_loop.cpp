@@ -56,6 +56,10 @@ Async::IoUringLoop::IoUringLoop(
         logger.error("[DNS] WARNING: Resolver failed to initialise: " + std::string(ex.what()));
     }
 
+    idle_timeout_ = std::chrono::seconds(get_limit("idle_timeout", 300));
+    max_connections_ = get_limit("max_connections", 200);
+    max_connections_per_ip_ = get_limit("max_connections_per_ip", 20);
+
     setup_listen_socket();
 }
 
@@ -139,7 +143,7 @@ void Async::IoUringLoop::setup_listen_socket()
         );
     }
 
-    if (::listen(listen_fd_, 5) < 0) {
+    if (::listen(listen_fd_, SOMAXCONN) < 0) {
         logger.error("[FATA] [IO_URING] listen(): " + std::string(strerror(errno)));
         throw std::runtime_error(
             std::string("listen(): ") + strerror(errno)
@@ -178,6 +182,11 @@ void Async::IoUringLoop::arm_accept() {
 
 void Async::IoUringLoop::run() {
     arm_accept();
+
+    // Without this, a client that connects and says nothing holds its slot forever
+    arm_periodic_timer(std::chrono::seconds(1), [this]() {
+        close_idle_connections();
+        });
 
     io_uring_cqe* cqe = nullptr;
 
@@ -249,11 +258,6 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     // Always re-arm accept first so we don't miss new connections
     arm_accept();
 
-    if (buffers_.size() >= 100) {
-        ::close(res);
-        return;
-    }
-
     if (res <= 0) {
         if (res < 0) {
             logger.error("[ACCEPT] Error: " + std::string(strerror(-res)));
@@ -262,13 +266,32 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     }
 
     int client_fd = res;
-    uint64_t cid = next_conn_id++;
 
     // TODO: Log the new connection: Preferably with DB writes
     char ip_buf[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &client_addr_.sin_addr, ip_buf, sizeof(ip_buf));
 
+    // One address can't take every slot, so the cap only shuts out whoever is hogging it
+    size_t from_ip = 0;
+    for (const auto& [id, conn] : buffers_) {
+        if (conn.ip == ip_buf) {
+            ++from_ip;
+        }
+    }
+
+    if (buffers_.size() >= max_connections_ || from_ip >= max_connections_per_ip_) {
+        logger.warn(
+            "[ACCEPT] Refusing " + std::string(ip_buf) + ": " + std::to_string(from_ip) + " open from this address, "
+            + std::to_string(buffers_.size()) + " in total"
+        );
+        ::close(client_fd);
+        return;
+    }
+
+    uint64_t cid = next_conn_id++;
+
     auto& buf = buffers_[cid];
+    buf.ip = ip_buf;
     buf.fd = client_fd;
     buf.read_buf.resize(READ_BUF_SIZE);
 
@@ -326,6 +349,8 @@ void Async::IoUringLoop::on_read(uint64_t conn_id, int res) {
         submit_close(conn_id);
         return;
     }
+
+    bit->second.last_active = std::chrono::steady_clock::now();
 
     std::span<uint8_t> data(bit->second.read_buf.data(), static_cast<size_t>(res));
 
@@ -461,6 +486,39 @@ void Async::IoUringLoop::on_write(uint64_t conn_id, int res) {
             + " inflight=" + std::to_string(bit->second.inflight)
         );
 
+        submit_close(conn_id);
+    }
+}
+
+void Async::IoUringLoop::close_idle_connections() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<uint64_t> idle;
+
+    for (const auto& [conn_id, conn] : buffers_) {
+        // A big response still going out to a slow reader isn't idleness
+        if (conn.closing || conn.write_pending) {
+            continue;
+        }
+
+        auto sit = sessions_.find(conn_id);
+        auto limit = (sit != sessions_.end()) ? sit->second->idle_timeout(idle_timeout_) : idle_timeout_;
+
+        if (now - conn.last_active >= limit) {
+            idle.push_back(conn_id);
+        }
+    }
+
+    for (uint64_t conn_id : idle) {
+        auto bit = buffers_.find(conn_id);
+        if (bit == buffers_.end()) {
+            continue;
+        }
+
+        logger.info("[IDLE] conn=" + std::to_string(conn_id) + " from=" + bit->second.ip + " timed out, closing");
+
+        // The pending recv would never complete on a silent socket. Shutting it down
+        // completes the recv with 0, and on_read then finishes the close
+        ::shutdown(bit->second.fd, SHUT_RDWR);
         submit_close(conn_id);
     }
 }

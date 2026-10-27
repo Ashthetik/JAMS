@@ -64,7 +64,9 @@ def test_many_simultaneous_connections():
 
     try:
         for _ in range(NUM_SLOW_CONNS):
-            s = socket.create_connection(("127.0.0.1", 2525), timeout=5)
+            # The slow clients come from their own address: one address is capped
+            # (max_connections_per_ip), and the point is that everyone else still gets in
+            s = socket.create_connection(("127.0.0.1", 2525), timeout=5, source_address=("127.0.0.2", 0))
             s.recv(1024)
             s.sendall(b"MAIL FROM:<slow@evil.test")  
             sockets.append(s)

@@ -79,6 +79,10 @@ namespace IMAP {
             tls_upgrade_pending_ = false;
         }
 
+        /// @brief Logged in sessions get [limits] imap_idle_timeout (RFC 3501 5.4: at least 30 minutes,
+        /// which also covers IDLE). Before login the listener's normal timeout applies
+        std::chrono::seconds idle_timeout(std::chrono::seconds fallback) const override;
+
     private:
         bool tls_upgrade_pending_{ false };
 
