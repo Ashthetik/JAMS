@@ -1,8 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <sqlite3.h>
 
@@ -38,7 +41,8 @@ namespace Auth {
         bool add_user(const std::string& username, const std::string& passwd, const std::string& ip);
 
         /// @brief Verify the credentials, returns false on incorrect, unknown, or inactive accounts.
-        /// This function works in constant-time
+        /// This function works in constant-time. An address over the failed login limit is
+        /// refused before any hashing, even with the right password
         /// @param username 
         /// @param passwd 
         /// @param ip
@@ -80,6 +84,29 @@ namespace Auth {
         }
 
     private:
+        /// @brief Failed logins one address may make within AUTH_FAILURE_WINDOW before it is
+        /// refused outright. Every check costs a PBKDF2 run, so this is what keeps guessing cheap for us
+        static constexpr int MAX_AUTH_FAILURES = 10;
+        static constexpr std::chrono::seconds AUTH_FAILURE_WINDOW{ 600 };
+
+        struct FailureWindow {
+            int count{ 0 };
+            std::chrono::steady_clock::time_point start;
+        };
+
+        // verify() is called from the IMAP, IMAPS and submission threads
+        std::mutex failures_mutex_;
+        std::unordered_map<std::string, FailureWindow> failures_;
+
+        /// @brief True if this address has used up its failed logins for the current window
+        /// @param ip 
+        /// @return 
+        bool is_throttled(const std::string& ip);
+
+        /// @brief Counts a failed login against an address
+        /// @param ip 
+        void record_failure(const std::string& ip);
+
         struct HashedPassword {
             std::string hash; // base64 encoded SHA256
             std::string salt; // base64 encoded hash salt
