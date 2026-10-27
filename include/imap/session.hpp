@@ -132,6 +132,18 @@ namespace IMAP {
 
         void ensure_mailbox_dirs(const std::string& mailbox);
 
+        /// @brief Checks a client-supplied mailbox name before it is used to build a path.
+        /// Rejects separators, dot segments, control characters and Maildir internals
+        /// so a mailbox name can never resolve outside the user's own Maildir
+        /// @param mailbox
+        /// @return
+        static bool is_valid_mailbox_name(const std::string& mailbox);
+
+        /// @brief Builds the Maildir directory for a mailbox that has already been validated
+        /// @param mailbox
+        /// @return
+        std::string mailbox_root(const std::string& mailbox) const;
+
         void ensure_standard_folders();
 
         void notify_new_email();
@@ -209,6 +221,9 @@ namespace IMAP {
 
         /// @brief "JAMS" in hexadecimal
         static constexpr uint32_t IMAP_UUID_VALIDITY = 0x4A414D53;
+
+        /// @brief Largest message APPEND will accept, matching the SMTP SIZE limit (RFC 7889 APPENDLIMIT)
+        static constexpr size_t MAX_APPEND_SIZE = 52428800;
 
         uint64_t conn_id_;
         std::string remote_ip_;

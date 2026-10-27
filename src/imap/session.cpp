@@ -25,15 +25,50 @@ mail_root_(mail_root) {
     untagged("OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE] JAMS IMAP server ready");
 }
 
-std::string Session::message_path(const MessageMeta& msg) const {
-    std::string dir = msg.in_cur ? "/cur/" : "/new/";
-    std::string base = mail_root_ + "/" + username_;
-
-    if (selected_mailbox_ != "INBOX") {
-        base += "/." + selected_mailbox_;
+bool Session::is_valid_mailbox_name(const std::string& mailbox) {
+    if (mailbox.empty() || mailbox.size() > 255) {
+        return false;
     }
 
-    return base + dir + msg.filename;
+    /**
+     * Mailbox names become a single Maildir++ directory (".Name"), so anything
+     * that could act as a path separator or dot segment is refused outright
+     * rather than sanitised.
+     */
+    if (mailbox.front() == '.' || mailbox.back() == '.' || mailbox.find("..") != std::string::npos) {
+        return false;
+    }
+
+    for (const char c : mailbox) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7F || c == '/' || c == '\\' || c == '"') {
+            return false;
+        }
+    }
+
+    // Maildir's own subdirectories are never valid mailbox names
+    if (mailbox == "cur" || mailbox == "new" || mailbox == "tmp") {
+        return false;
+    }
+
+    return true;
+}
+
+std::string Session::mailbox_root(const std::string& mailbox) const {
+    std::string base = mail_root_ + "/" + username_;
+
+    // Subfolders are as per Maildir++ convention: .FolderName
+    if (mailbox != "INBOX") {
+        base += "/." + mailbox;
+    }
+
+    return base;
+}
+
+std::string Session::message_path(const MessageMeta& msg) const {
+    std::string dir = msg.in_cur ? "/cur/" : "/new/";
+
+    return mailbox_root(selected_mailbox_) + dir + msg.filename;
 }
 
 void Session::on_data(std::span<const uint8_t> bytes) {
@@ -66,6 +101,11 @@ void Session::on_data(std::span<const uint8_t> bytes) {
 
             if (tls_upgrade_pending_) {
                 tls_upgrade_pending_ = false;
+                return;
+            }
+
+            // Anything after LOGOUT, or after a refused LITERAL+ append, is not a command
+            if (state_ == State::Logout) {
                 return;
             }
 
@@ -322,7 +362,7 @@ void Session::cmd_idle_done() {
 }
 
 void Session::cmd_capability(const std::string& tag) {
-    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR");
+    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR APPENDLIMIT=" + std::to_string(MAX_APPEND_SIZE));
 
     ok(tag, "CAPABILITY completed");
 }
@@ -424,6 +464,18 @@ void Session::cmd_append(const std::string& tag, const std::string& args) {
         return;
     }
 
+    std::string u_mbox = mbox;
+    std::transform(u_mbox.begin(), u_mbox.end(), u_mbox.begin(), ::toupper);
+
+    if (u_mbox == "INBOX") {
+        mbox = "INBOX";
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[CANNOT] Invalid mailbox name");
+        return;
+    }
+
     // Skip optional flags
     std::string flags;
     auto trim_ws = [](const std::string& ws) {
@@ -456,25 +508,44 @@ void Session::cmd_append(const std::string& tag, const std::string& args) {
 
     size_t sz = 0;
     auto inner = rest.substr(1, rest.size() - 2);
+    bool non_synchronizing{ false };
 
     if (!inner.empty() && inner.back() == '+') {
         inner.pop_back();
+        non_synchronizing = true;
     }
 
     auto [ptr, ec] = std::from_chars(inner.data(), inner.data() + inner.size(), sz);
-    if (ec != std::errc{}) {
+    if (ec != std::errc{} || ptr != inner.data() + inner.size()) {
         bad(tag, "Bad literal size");
+        return;
+    }
+
+    if (sz == 0 || sz > MAX_APPEND_SIZE) {
+        /**
+         * A LITERAL+ client sends the message bytes without waiting for "+",
+         * so after refusing it the rest of the stream is message data, not
+         * commands. RFC 7888 section 4: reject with BAD and close the connection.
+         */
+        if (non_synchronizing) {
+            bad(tag, "[TOOBIG] Message size exceeds the APPENDLIMIT, closing connection");
+            state_ = State::Logout;
+            loop_.submit_close(conn_id_);
+            return;
+        }
+
+        no(tag, sz == 0 ? "Empty message" : "[TOOBIG] Message size exceeds the APPENDLIMIT");
         return;
     }
 
     ensure_mailbox_dirs(mbox);
 
-    // Arm literal reader
+    // Arm literal reader. The buffer grows as bytes arrive rather than
+    // reserving whatever size the client claimed up front.
     append_tag_ = tag;
     append_mailbox_ = mbox;
     append_flags_ = flags;
     literal_buf_.clear();
-    literal_buf_.reserve(sz);
     literal_remaining_ = sz;
     literal_pending_ = true;
 
@@ -487,8 +558,16 @@ void Session::cmd_create(const std::string& tag, const std::string& args) {
         mbox = mbox.substr(1, mbox.size() - 2);
     }
 
-    if (mbox.empty() || mbox == "INBOX") {
+    std::string u_mbox = mbox;
+    std::transform(u_mbox.begin(), u_mbox.end(), u_mbox.begin(), ::toupper);
+
+    if (mbox.empty() || u_mbox == "INBOX") {
         no(tag, "Cannot create that mailbox");
+        return;
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[CANNOT] Invalid mailbox name");
         return;
     }
 
@@ -530,12 +609,7 @@ void Session::complete_append() {
 
     ensure_mailbox_dirs(append_mailbox_);
 
-    std::string base = mail_root_ + "/" + username_;
-    if (append_mailbox_ != "INBOX") {
-        base += "/." + append_mailbox_;
-    }
-
-    std::string path = base + "/cur/" + fname;
+    std::string path = mailbox_root(append_mailbox_) + "/cur/" + fname;
     std::ofstream out(path, std::ios::binary);
 
     if (!out) {
@@ -561,10 +635,7 @@ void Session::complete_append() {
 }
 
 void Session::ensure_mailbox_dirs(const std::string& mailbox) {
-    std::string base = mail_root_ + "/" + username_;
-    if (mailbox != "INBOX") {
-        base += "/." + mailbox;
-    }
+    std::string base = mailbox_root(mailbox);
 
     // Sanity check to ensure the base dir is real
     ::mkdir(base.c_str(), 0700);
@@ -639,6 +710,11 @@ void Session::cmd_select(
 
     if (u_mbox == "INBOX") {
         mbox = "INBOX";
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[NONEXISTENT] Invalid mailbox name");
+        return;
     }
 
     load_mailbox(mbox);
@@ -882,13 +958,7 @@ std::string Session::fetch_message(
 
 std::vector<uint8_t> Session::read_blob(const MessageMeta& msg) const {
     std::string dir = msg.in_cur ? "/cur/" : "/new/";
-    std::string base = mail_root_ + "/" + username_;
-
-    if (selected_mailbox_ != "INBOX") {
-        base += "/." + selected_mailbox_;
-    }
-
-    std::string path = base + dir + msg.filename;
+    std::string path = mailbox_root(selected_mailbox_) + dir + msg.filename;
     std::ifstream file(path, std::ios::binary);
 
     if (!file) {
@@ -1151,12 +1221,7 @@ void Session::load_mailbox(const std::string& mailbox) {
     messages_.clear();
     next_uuid_ = 1;
 
-    std::string base = mail_root_ + "/" + username_;
-    if (mailbox != "INBOX") {
-        // Subfolders are as per Maildir++ convention:
-        // .FolderName
-        base += "/." + mailbox;
-    }
+    std::string base = mailbox_root(mailbox);
 
     uint32_t seq = 0;
 

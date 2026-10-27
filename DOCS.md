@@ -140,29 +140,21 @@ sudo openssl req -x509 -newkey rsa:4096 \
 	-subj "/CN=your.maildomain.com"
 ```
 
-4. Add Users
-The SQLite DB is created automatically by JAMS at `/var/lib/jams/users.db` or next to the mailserver binary on first run. The Schema is as follows:
-```sql
-CREATE TABLE users (
-	username TEXT PRIMARY KEY,
-	hash TEXT NOT NULL,
-	salt TEXT NOT NULL,
-	iterations INTEGER NOT NULL,
-	active INTEGER NOT NULL DEFAULT 1,
-	created_at TEXT NOT NULL
-);
+4. Set the password pepper
+JAMS derives every password salt from the `JAMS_PEPPER` environment variable and refuses to start without it. Use a long random value and keep it stable: changing or losing it invalidates every stored password.
+```sh
+export JAMS_PEPPER="$(openssl rand -hex 32)"   # store this somewhere safe
 ```
-> [!WARNING]
-> Never insert plaintext passwords. Passwords must be stored as PBKDF2-HMAC-SHA256 (100,000 iterations). A user-management CLI is planned, until then use the `CredentialStore` API in the `main.cpp`  
->  
-> You can do so with the following after the CredentialStore initialisation:
 
-```cpp
-const bool user_create = cred_store.add_user("username", "password");
-if (!user_create) {
-	std::cerr << "[JAMS - CredStore] Failed to create user!" << std::endl;
-}
+5. Add Users
+The SQLite DB is created automatically on first run at the `dbpath` set in `server.toml`. Create accounts with `--add-user`, which hashes the password (PBKDF2-HMAC-SHA256, 100,000 iterations) and exits:
+```sh
+./build/mailserver --add-user alice 'a-strong-password'
 ```
+Usernames may contain letters, digits, `.`, `-`, `_` and `+`.
+
+> [!WARNING]
+> Never insert plaintext passwords into the database directly.
 
 ---
 # Running the Server
@@ -171,14 +163,16 @@ if (!user_create) {
 ```
 ### Command-Line Options
 
-| Flag                 | Default                  | Description          |
-| -------------------- | ------------------------ | -------------------- |
-| `--smtp-port <port>` | 25                       | Inbound ESMTP Port   |
-| `--db <path>`        | `/var/lib/jams/users.db` | Path to User DB      |
-| `--help`             | —                        | Print Usage and Exit |
+| Flag                               | Description                    |
+| ---------------------------------- | ------------------------------ |
+| `--add-user <username> <password>` | Create an account and exit     |
+| `--no-logs`                        | Disable logging                |
+| `--help`                           | Print usage and exit           |
+
+Ports and the database path are set in `config/server.toml`. Environment variables: `JAMS_PEPPER` (required), `JAMS_CONFIG` (path to `server.toml`), `JAMS_LOG_PATH` (log file).
 #### Example
 ```sh
-./build/mailserver --smtp-port 25 --db ./users.db
+JAMS_PEPPER=... ./build/mailserver
 ```
 The server will print the start banner, initialise all four listeners and run until an issued `SIGINT` or `SIGTERM` signal is received. All threads will then proceed to gracefully shutdown.
 
@@ -192,7 +186,10 @@ After=network.target
 [Service]
 Type=simple
 User=mailserver
-ExecStart=/usr/local/bin/mailserver --db /var/lib/jams/users.db
+# Keep the pepper out of the unit file itself, e.g. JAMS_PEPPER=... in a root-only file
+EnvironmentFile=/etc/jams/jams.env
+Environment=JAMS_CONFIG=/etc/jams/server.toml
+ExecStart=/usr/local/bin/mailserver
 Restart=on-failure
 RestartSec=5
 
