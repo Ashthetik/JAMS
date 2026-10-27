@@ -83,6 +83,17 @@ namespace SMTP
         /// @return
         auto strip_header(const std::string& body, const std::string& header_name);
 
+        /// @brief True if the authenticated user may send as this address:
+        /// their own mailbox on this domain, or one of their active aliases
+        /// @param address
+        /// @return
+        bool owns_address(const std::string& address);
+
+        /// @brief True if every address in the message's From header is one the user owns
+        /// @param message
+        /// @return
+        bool from_header_owned(const std::string& message);
+
         bool relay_outbound(
             const std::string& from, const std::string& to,
             const std::string& domain, const std::string& body);
