@@ -25,8 +25,27 @@ Session::Session(
     Auth::CredentialStore& cred_store, const std::string& mail_root
 ) : conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), cred_store_(cred_store),
 mail_root_(mail_root) {
-    // Send greeting on connect
-    untagged("OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE] JAMS IMAP server ready");
+    // Send greeting on connect (on IMAPS this is held until the TLS handshake completes)
+    untagged("OK [CAPABILITY " + capabilities() + "] JAMS IMAP server ready");
+}
+
+bool Session::tls_secured() const {
+    return loop_.is_implicit_tls() || loop_.has_tls(conn_id_);
+}
+
+std::string Session::capabilities() const {
+    std::string caps = "IMAP4rev1";
+
+    if (tls_secured()) {
+        caps += " AUTH=PLAIN";
+    }
+    else {
+        // RFC 3501 sections 6.2.1 and 6.2.3
+        caps += " STARTTLS LOGINDISABLED";
+    }
+
+    caps += " LITERAL+ SASL-IR APPENDLIMIT=" + std::to_string(MAX_APPEND_SIZE);
+    return caps;
 }
 
 bool Session::is_valid_mailbox_name(const std::string& mailbox) {
@@ -192,6 +211,12 @@ void Session::process_line(const std::string& line) {
             return;
         }
 
+        if ((command == "LOGIN" || command == "AUTHENTICATE") && !tls_secured()) {
+            // Refuse before reading any credentials (RFC 3501 6.2.3, RFC 5530 PRIVACYREQUIRED)
+            no(tag, "[PRIVACYREQUIRED] Run STARTTLS before logging in");
+            return;
+        }
+
         if (command == "LOGIN") {
             cmd_login(tag, args);
             return;
@@ -312,7 +337,7 @@ void Session::process_line(const std::string& line) {
 }
 
 void Session::cmd_capability(const std::string& tag) {
-    untagged("CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN LITERAL+ SASL-IR APPENDLIMIT=" + std::to_string(MAX_APPEND_SIZE));
+    untagged("CAPABILITY " + capabilities());
 
     ok(tag, "CAPABILITY completed");
 }
@@ -336,6 +361,11 @@ void Session::cmd_logout(const std::string& tag) {
 void Session::cmd_starttls(const std::string& tag) {
     if (tls_upgrade_pending_) {
         bad(tag, "TLS already pending");
+        return;
+    }
+
+    if (tls_secured()) {
+        bad(tag, "TLS is already active");
         return;
     }
 
