@@ -6,6 +6,7 @@
 
 #include <cctype>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <resolv.h>
 #include <netinet/in.h>
@@ -55,14 +56,23 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
                 line_buf_.clear();
                 data_tail_.clear();
 
-                if (deliver()) {
+                /**
+                 * Whatever the outcome, the transaction is over: the user stays
+                 * logged in and can start the next message with MAIL FROM.
+                 * Leaving the state at Data would read later commands as message text.
+                 */
+                if (!from_header_owned(env_.body)) {
+                    reply(550, "5.7.1 From header must only contain addresses you own");
+                }
+                else if (deliver()) {
                     reply(250, "OK: Message Accepted");
-                    state_ = State::Greeted;
-                    env_ = {};
                 }
                 else {
                     reply(452, "Insufficient Storage");
                 }
+
+                state_ = State::Authenticated;
+                env_ = {};
             }
         }
         else {
@@ -168,10 +178,11 @@ auto SubmissionServer::strip_header(const std::string& body, const std::string& 
         }
 
         if (stripped.empty()) {
-            skipping = false;
+            // End of the header block: the body is copied byte for byte, never filtered
             result += line + "\n";
+            result.append(std::istreambuf_iterator<char>(ss), std::istreambuf_iterator<char>());
 
-            continue;
+            return result;
         }
 
         std::string lower{ stripped };
@@ -338,6 +349,111 @@ void SubmissionServer::cmd_auth(std::string_view arg) {
     }
 }
 
+bool SubmissionServer::owns_address(const std::string& address) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    };
+
+    const std::string wanted = lower(address);
+    if (wanted.empty() || sasl_.username().empty()) {
+        return false;
+    }
+
+    if (wanted == lower(sasl_.username()) + "@" + lower(get_hostname())) {
+        return true;
+    }
+
+    for (const auto& alias : aliases_.list_for(sasl_.username())) {
+        if (lower(alias) == wanted) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool SubmissionServer::from_header_owned(const std::string& message) {
+    // Collect the unfolded From header value(s) from the header block only
+    std::vector<std::string> values;
+    std::istringstream ss(message);
+    std::string line;
+    bool in_from{ false };
+
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        if (line.empty()) {
+            break; // end of headers
+        }
+
+        if (line[0] == ' ' || line[0] == '\t') {
+            if (in_from) {
+                values.back() += " " + line; // folded continuation of this From header
+            }
+            continue;
+        }
+
+        const size_t colon = line.find(':');
+        std::string name = line.substr(0, colon);
+        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+
+        in_from = (colon != std::string::npos && name == "from");
+        if (in_from) {
+            values.push_back(line.substr(colon + 1));
+        }
+    }
+
+    std::vector<std::string> addresses;
+    for (std::string value : values) {
+        // Drop (comments), which may contain anything
+        std::string cleaned;
+        int depth = 0;
+        for (const char c : value) {
+            if (c == '(') { ++depth; continue; }
+            if (c == ')' && depth > 0) { --depth; continue; }
+            if (depth == 0) { cleaned += c; }
+        }
+
+        if (cleaned.find('<') != std::string::npos) {
+            // Display names may contain commas, so only trust what is inside <...>
+            size_t pos = 0;
+            while ((pos = cleaned.find('<', pos)) != std::string::npos) {
+                const size_t close = cleaned.find('>', pos);
+                if (close == std::string::npos) {
+                    return false;
+                }
+                addresses.push_back(std::string(trim(cleaned.substr(pos + 1, close - pos - 1))));
+                pos = close + 1;
+            }
+        }
+        else {
+            std::istringstream parts(cleaned);
+            std::string part;
+            while (std::getline(parts, part, ',')) {
+                if (!trim(part).empty()) {
+                    addresses.push_back(std::string(trim(part)));
+                }
+            }
+        }
+    }
+
+    // RFC 5322 3.6.2 requires a From header; every address in it must be the user's
+    if (addresses.empty()) {
+        return false;
+    }
+
+    for (const auto& address : addresses) {
+        if (!owns_address(address)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void SubmissionServer::cmd_helo(std::string_view arg) {
     client_helo_ = std::string(trim(arg));
     env_ = {};
@@ -357,21 +473,22 @@ void SubmissionServer::cmd_mail(std::string_view arg) {
         return;
     }
 
-    auto addr = std::string(extract_address(arg.substr(5)));
-    auto at = addr.find('@');
-    const std::string domain = (at != std::string::npos) ? addr.substr(at + 1) : "";
-
-    std::string domain_lower = domain;
-    std::transform(domain_lower.begin(), domain_lower.end(), domain_lower.begin(), ::tolower);
-
-
     std::string upper(arg);
     for (char& c : upper) {
         c = static_cast<char>(std::toupper(c));
     }
 
+    // Check the syntax before slicing, so a short argument can't throw
     if (upper.substr(0, 5) != "FROM:") {
         reply(501, "Syntax: MAIL FROM:<address>");
+        return;
+    }
+
+    auto addr = std::string(extract_address(arg.substr(5)));
+
+    // RFC 6409 6.1: the MSA may only accept senders the authenticated user is allowed to use
+    if (!owns_address(addr)) {
+        reply(550, "5.7.1 Sender address not owned by the authenticated user");
         return;
     }
 
@@ -564,7 +681,8 @@ bool SubmissionServer::deliver() {
             }
 
             Storage::MailDir mdir(target_path);
-            auto stored_path = mdir.deliver(env_.mail_from, rcpt, env_.body);
+            // Recipients must never see the Bcc list (RFC 5322 3.6.3)
+            auto stored_path = mdir.deliver(env_.mail_from, rcpt, outbound_body);
 
             if (!stored_path) {
                 logger.error("[DELIVER] Failed for: " + rcpt);
@@ -576,7 +694,7 @@ bool SubmissionServer::deliver() {
             }
         }
         else {
-            if (!relay_outbound(env_.mail_from, rcpt, domain, env_.body)) {
+            if (!relay_outbound(env_.mail_from, rcpt, domain, outbound_body)) {
                 logger.error("[DELIVER] Relay failed for: " + rcpt);
                 all_ok = false;
             }
