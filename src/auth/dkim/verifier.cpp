@@ -372,7 +372,7 @@ std::string Verifier::canonicalize_body(const std::string& body, const std::stri
         std::string pending; // Buffer trailing emptiness
 
         while (std::getline(ss, line)) {
-            if (!line.empty()) {
+            if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
 
@@ -404,9 +404,9 @@ std::string Verifier::canonicalize_body(const std::string& body, const std::stri
             }
         }
 
-        // If the body is empty, treat it as a single CRLF
+        // RFC 6376 3.4.4: with relaxed, an empty body stays empty (simple is the one that becomes CRLF)
         if (result.empty()) {
-            return "\r\n";
+            return "";
         }
 
         return result;
@@ -497,7 +497,8 @@ std::string Verifier::canonicalize_header(
         }
 
         // trim leading SP
-        if (size_t start = canon_value.find_first_not_of(' ') != std::string::npos) {
+        const size_t start = canon_value.find_first_not_of(' ');
+        if (start != std::string::npos) {
             canon_value = canon_value.substr(start);
         }
 
@@ -580,6 +581,11 @@ std::string Verifier::build_signed_header_block(
     }
 
     result += canonicalize_header("dkim-signature", dkim_for_signing, signature.header_canon);
+
+    // RFC 6376 3.7: the DKIM-Signature header is hashed without its trailing CRLF
+    if (result.size() >= 2 && result.compare(result.size() - 2, 2, "\r\n") == 0) {
+        result.resize(result.size() - 2);
+    }
 
     return result;
 }

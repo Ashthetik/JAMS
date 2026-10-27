@@ -909,32 +909,9 @@ bool SubmissionServer::relay_outbound(
     std::string outbound = body;
 
     if (ok) {
-        std::string msg_headers;
-        std::string msg_body;
-
-        auto sep = body.find("\r\n\r\n");
-        if (sep != std::string::npos) {
-            msg_headers = body.substr(0, sep + 2);
-            msg_body = body.substr(sep + 4);
-        }
-        else {
-            sep = body.find("\n\n");
-            if (sep != std::string::npos) {
-                msg_headers = body.substr(0, sep + 1);
-                msg_body = body.substr(sep + 2);
-            }
-            else {
-                logger.error("[RELAY] No header/body separator found in message - malformed");
-                return false;
-            }
-        }
-
         try {
-            logger.debug("[RELAY] Outbound headers:\n" + msg_headers);
-            outbound = dkim_signer_.sign(msg_headers, msg_body);
+            outbound = dkim_signer_.sign_message(body);
             logger.debug("[RELAY] Signed message:\n" + outbound);
-
-            outbound += "\r\n" + msg_body;
         }
         catch (const std::exception& e) {
             logger.error("[OUTBOUND_RELAY] DKIM Signing failed: " + std::string(e.what()));
