@@ -75,5 +75,14 @@ std::unordered_map<std::string, std::string> TOMLParser::fetch_configs() {
         { "ip_alert_mta", ip_reporting_mta }
         });
 
+    // [limits] is optional, anything left out keeps its built-in default (see globals.hpp)
+    for (const char* key : { "idle_timeout", "imap_idle_timeout", "max_connections", "max_connections_per_ip" }) {
+        auto value = toml_results->get({ "limits", key });
+
+        if (value && value->as_int() && *value->as_int() > 0) {
+            results.insert({ key, std::to_string(*value->as_int()) });
+        }
+    }
+
     return results;
 }

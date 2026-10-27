@@ -13,3 +13,12 @@ dbpath = "/var/lib/jams/users.db"
 
 [reporting]
 ip_alert_mta = "john.doe@example.com"
+
+[limits]
+# Seconds a connection may stay silent before it is closed (SMTP, and IMAP before login)
+idle_timeout = 300
+# Seconds a logged in IMAP session may stay silent, at least 30 minutes per RFC 3501
+imap_idle_timeout = 1800
+# Open connections allowed per listener, and from any one address
+max_connections = 200
+max_connections_per_ip = 20

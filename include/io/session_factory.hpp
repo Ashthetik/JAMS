@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <chrono>
 #include <cstdint>
 
 namespace SMTP {
@@ -10,5 +11,9 @@ namespace SMTP {
         virtual ~ISession() = default;
         virtual bool wants_tls_upgrade() const { return false; }
         virtual void clear_tls_upgrade() {}
+
+        /// @brief How long the client may stay silent before the connection is closed.
+        /// fallback is the listener's [limits] idle_timeout
+        virtual std::chrono::seconds idle_timeout(std::chrono::seconds fallback) const { return fallback; }
     };
 };

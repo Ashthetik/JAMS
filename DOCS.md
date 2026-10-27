@@ -216,6 +216,10 @@ Below is a table of configurable variables in JAMS, which can be changed with th
 | Outbound (Submission) Port | 587                      | `src/main.cpp`              |
 | Max Message Size           | 50MB                     | `src/smtp/smtp_session.cpp` |
 | Max Recipients             | 100                      | `src/smtp/smtp_session.cpp` |
+| Idle Timeout               | 300s (`[limits] idle_timeout`, SMTP and IMAP before login) | `src/io/io_uring_loop.cpp` |
+| IMAP Idle Timeout          | 1800s (`[limits] imap_idle_timeout`, logged in IMAP) | `src/imap/session.cpp` |
+| Max Connections            | 200 per listener (`[limits] max_connections`) | `src/io/io_uring_loop.cpp` |
+| Max Connections Per IP     | 20 per listener (`[limits] max_connections_per_ip`) | `src/io/io_uring_loop.cpp` |
 
 > [!NOTE]
 > Max Message Size and Max Recipients is non-configurable to better align with their applicable RFCs and will be made configurable once JAMS has reached it's stable release (v1.0.0)

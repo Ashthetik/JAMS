@@ -25,6 +25,14 @@ mail_root_(mail_root) {
     untagged("OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE] JAMS IMAP server ready");
 }
 
+std::chrono::seconds Session::idle_timeout(std::chrono::seconds fallback) const {
+    if (state_ == State::NotAuthenticated) {
+        return fallback;
+    }
+
+    return std::chrono::seconds(get_limit("imap_idle_timeout", 1800));
+}
+
 bool Session::is_valid_mailbox_name(const std::string& mailbox) {
     if (mailbox.empty() || mailbox.size() > 255) {
         return false;

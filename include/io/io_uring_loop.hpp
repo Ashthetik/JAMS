@@ -107,6 +107,16 @@ namespace Async {
         void arm_periodic_timer(std::chrono::seconds interval, std::function<void()> callback);
 
     private:
+        /// @brief Closes connections that have been silent longer than their session's idle timeout
+        void close_idle_connections();
+
+        /// @brief Silence allowed before a connection is closed ([limits] idle_timeout, RFC 5321 4.5.3.2 floor)
+        std::chrono::seconds idle_timeout_;
+
+        /// @brief Open connections allowed on this listener, and from any one address
+        size_t max_connections_;
+        size_t max_connections_per_ip_;
+
         struct PeriodicTimer {
             __kernel_timespec ts;
             std::function<void()> callback;
@@ -161,6 +171,8 @@ namespace Async {
 
         static constexpr size_t READ_BUF_SIZE = 8192;
         struct ConnBuffer {
+            std::string ip;
+            std::chrono::steady_clock::time_point last_active{ std::chrono::steady_clock::now() };
             std::vector<uint8_t> read_buf;
             std::deque<std::vector<uint8_t>> write_queue;
             bool write_pending{ false };
