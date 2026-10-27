@@ -83,3 +83,9 @@ target_link_libraries(mailserver PRIVATE
     crypt
     resolv
 )
+
+# Test helper: signs a message from stdin with the real DKIM signer, so the
+# integration tests can check the output with an independent verifier
+add_executable(dkim_sign tests/tools/dkim_sign.cpp src/auth/dkim/signer.cpp)
+target_include_directories(dkim_sign PRIVATE ${CMAKE_SOURCE_DIR}/include ${OPENSSL_INCLUDE_DIR})
+target_link_libraries(dkim_sign PRIVATE OpenSSL::Crypto)
