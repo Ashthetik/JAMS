@@ -22,7 +22,8 @@ def test_oversized_line_reject(jams_server):
 
 def test_max_rcpt(jams_server):
     lines = ["EHLO test.local", "MAIL FROM:<a@test.local>"]
-    lines += [f"RCPT TO:<user{i}@alocalhost>" for i in range(105)]
+    # Recipients must be real local mailboxes to be accepted, so repeat a known one to reach the limit
+    lines += ["RCPT TO:<ci-test-user@test.local>" for _ in range(105)]
     replies = smtp_roundtrip(2525, lines)
 
     assert b"452" in replies[-1]

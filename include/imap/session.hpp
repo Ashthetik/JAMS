@@ -84,6 +84,15 @@ namespace IMAP {
 
         void cmd_capability(const std::string& tag);
 
+        /// @brief True once the connection is encrypted (IMAPS, or after STARTTLS)
+        /// @return 
+        bool tls_secured() const;
+
+        /// @brief Capability list for the current state. Before TLS, LOGINDISABLED is
+        /// advertised and AUTH=PLAIN is withheld so clients never send passwords in cleartext
+        /// @return 
+        std::string capabilities() const;
+
         void cmd_noop(const std::string& tag);
 
         void cmd_logout(const std::string& tag);
