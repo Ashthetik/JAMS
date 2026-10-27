@@ -6,10 +6,13 @@
 #include "storage/maildir.hpp"
 
 #include <cstdint>
+#include <ctime>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace IMAP {
@@ -21,8 +24,9 @@ namespace IMAP {
     };
 
     struct MessageMeta {
-        uint32_t uuid; // derived from file timestamp
+        uint32_t uuid; // IMAP UID, kept per mailbox in jams-uidlist
         uint32_t seq; // sequence number from session
+        time_t internal_date{ 0 }; // derived from file timestamp
         std::string filename;
         std::string flags; // IMAP Flags: \Seen, \Answered, \Flagged, \Deleted
         size_t size; // blob size in bytes
@@ -75,6 +79,10 @@ namespace IMAP {
             tls_upgrade_pending_ = false;
         }
 
+        /// @brief Logged in sessions get [limits] imap_idle_timeout (RFC 3501 5.4: at least 30 minutes,
+        /// which also covers IDLE). Before login the listener's normal timeout applies
+        std::chrono::seconds idle_timeout(std::chrono::seconds fallback) const override;
+
     private:
         bool tls_upgrade_pending_{ false };
 
@@ -83,6 +91,15 @@ namespace IMAP {
         void process_line(const std::string& line);
 
         void cmd_capability(const std::string& tag);
+
+        /// @brief True once the connection is encrypted (IMAPS, or after STARTTLS)
+        /// @return 
+        bool tls_secured() const;
+
+        /// @brief Capability list for the current state. Before TLS, LOGINDISABLED is
+        /// advertised and AUTH=PLAIN is withheld so clients never send passwords in cleartext
+        /// @return 
+        std::string capabilities() const;
 
         void cmd_noop(const std::string& tag);
 
@@ -114,9 +131,9 @@ namespace IMAP {
 
         void cmd_status(const std::string& tag, const std::string& args);
 
-        void cmd_fetch(const std::string& tag, const std::string& args);
+        void cmd_fetch(const std::string& tag, const std::string& args, bool by_uid = false);
 
-        void cmd_store(const std::string& tag, const std::string& args);
+        void cmd_store(const std::string& tag, const std::string& args, bool by_uid = false);
 
         void cmd_expunge(const std::string& tag);
 
@@ -142,7 +159,12 @@ namespace IMAP {
 
         void ensure_standard_folders();
 
-        std::vector<uint32_t> parse_sequence_set(const std::string& set) const;
+        /// @brief Resolves a sequence set to the sequence numbers of the messages it names.
+        /// With by_uid the numbers in the set are UIDs (UID FETCH, UID STORE)
+        /// @param set 
+        /// @param by_uid 
+        /// @return 
+        std::vector<uint32_t> parse_sequence_set(const std::string& set, bool by_uid) const;
 
         /// @brief Fetches the given message from the maildir
         /// @param msg 
@@ -176,10 +198,33 @@ namespace IMAP {
         /// @brief Moves new/ messages to cur/ to mark that it's been seen by the server
         void incorporate_new();
 
-        /// @brief Derives the UUID from the maildir filename, specifically the timestamp
+        /// @brief Gives every loaded message its UID from the mailbox's jams-uidlist,
+        /// assigns new messages UIDs above every earlier one, then orders messages by UID
+        /// @param mailbox 
+        void assign_uuids(const std::string& mailbox);
+
+        /// @brief Reads a mailbox's jams-uidlist
+        /// @return false if the file is missing or unreadable
+        bool read_uuid_map(
+            const std::string& mailbox, uint32_t& validity, uint32_t& next,
+            std::unordered_map<std::string, uint32_t>& uuids
+        ) const;
+
+        /// @brief Atomically replaces a mailbox's jams-uidlist
+        void write_uuid_map(
+            const std::string& mailbox, uint32_t validity, uint32_t next,
+            const std::unordered_map<std::string, uint32_t>& uuids
+        ) const;
+
+        /// @brief The part of a Maildir filename that never changes, everything before ":2,"
         /// @param filename 
         /// @return 
-        static uint32_t uuid_from_file(const std::string& filename);
+        static std::string base_name(const std::string& filename);
+
+        /// @brief Derives the internal date from the maildir filename, specifically the timestamp
+        /// @param filename 
+        /// @return 
+        static time_t date_from_file(const std::string& filename);
 
         /// @brief Parses the flags from the filename suffix: ":2,<flags>"
         /// @param filename 
@@ -209,8 +254,11 @@ namespace IMAP {
         /// @param data 
         void untagged(const std::string& data);
 
-        /// @brief "JAMS" in hexadecimal
-        static constexpr uint32_t IMAP_UUID_VALIDITY = 0x4A414D53;
+        /// @brief Per-mailbox UID store, kept next to cur/ and new/ like dovecot-uidlist
+        static constexpr const char* UUID_MAP_FILE = "jams-uidlist";
+
+        /// @brief Serialises jams-uidlist updates, since 143 and 993 run on separate threads
+        static std::mutex uuid_map_mutex_;
 
         /// @brief Largest message APPEND will accept, matching the SMTP SIZE limit (RFC 7889 APPENDLIMIT)
         static constexpr size_t MAX_APPEND_SIZE = 52428800;
@@ -240,5 +288,6 @@ namespace IMAP {
 
         std::vector<MessageMeta> messages_;
         uint32_t next_uuid_{ 1 }; // The next UUID to assign
+        uint32_t uuid_validity_{ 0 }; // UIDVALIDITY of the selected mailbox
     };
 };

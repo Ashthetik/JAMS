@@ -14,8 +14,8 @@
 #include <cassert>
 
 Async::IoUringLoop::IoUringLoop(
-    uint16_t port, SessionFactory factory, unsigned queue_depth
-) : port_(port), session_factory_(std::move(factory)) {
+    uint16_t port, SessionFactory factory, bool implicit_tls, unsigned queue_depth
+) : port_(port), implicit_tls_(implicit_tls), session_factory_(std::move(factory)) {
     io_uring_params params{};
     params.flags = 0;
 
@@ -55,6 +55,10 @@ Async::IoUringLoop::IoUringLoop(
     catch (const std::exception& ex) {
         logger.error("[DNS] WARNING: Resolver failed to initialise: " + std::string(ex.what()));
     }
+
+    idle_timeout_ = std::chrono::seconds(get_limit("idle_timeout", 300));
+    max_connections_ = get_limit("max_connections", 200);
+    max_connections_per_ip_ = get_limit("max_connections_per_ip", 20);
 
     setup_listen_socket();
 }
@@ -139,7 +143,7 @@ void Async::IoUringLoop::setup_listen_socket()
         );
     }
 
-    if (::listen(listen_fd_, 5) < 0) {
+    if (::listen(listen_fd_, SOMAXCONN) < 0) {
         logger.error("[FATA] [IO_URING] listen(): " + std::string(strerror(errno)));
         throw std::runtime_error(
             std::string("listen(): ") + strerror(errno)
@@ -178,6 +182,11 @@ void Async::IoUringLoop::arm_accept() {
 
 void Async::IoUringLoop::run() {
     arm_accept();
+
+    // Without this, a client that connects and says nothing holds its slot forever
+    arm_periodic_timer(std::chrono::seconds(1), [this]() {
+        close_idle_connections();
+        });
 
     io_uring_cqe* cqe = nullptr;
 
@@ -249,11 +258,6 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     // Always re-arm accept first so we don't miss new connections
     arm_accept();
 
-    if (buffers_.size() >= 100) {
-        ::close(res);
-        return;
-    }
-
     if (res <= 0) {
         if (res < 0) {
             logger.error("[ACCEPT] Error: " + std::string(strerror(-res)));
@@ -262,15 +266,46 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
     }
 
     int client_fd = res;
-    uint64_t cid = next_conn_id++;
 
     // TODO: Log the new connection: Preferably with DB writes
     char ip_buf[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &client_addr_.sin_addr, ip_buf, sizeof(ip_buf));
 
+    // One address can't take every slot, so the cap only shuts out whoever is hogging it
+    size_t from_ip = 0;
+    for (const auto& [id, conn] : buffers_) {
+        if (conn.ip == ip_buf) {
+            ++from_ip;
+        }
+    }
+
+    if (buffers_.size() >= max_connections_ || from_ip >= max_connections_per_ip_) {
+        logger.warn(
+            "[ACCEPT] Refusing " + std::string(ip_buf) + ": " + std::to_string(from_ip) + " open from this address, "
+            + std::to_string(buffers_.size()) + " in total"
+        );
+        ::close(client_fd);
+        return;
+    }
+
+    uint64_t cid = next_conn_id++;
+
     auto& buf = buffers_[cid];
+    buf.ip = ip_buf;
     buf.fd = client_fd;
     buf.read_buf.resize(READ_BUF_SIZE);
+
+    // Implicit TLS: the handshake starts before the session exists, so its
+    // greeting is held until the handshake completes and goes out encrypted
+    if (implicit_tls_) {
+        if (!tls_ctx_) {
+            logger.error("[TLS] conn=" + std::to_string(cid) + " implicit TLS listener has no TLS context");
+            submit_close(cid);
+            return;
+        }
+
+        attach_tls(cid);
+    }
 
     // queue the 220 Banner (making the session available)
     try {
@@ -315,6 +350,8 @@ void Async::IoUringLoop::on_read(uint64_t conn_id, int res) {
         return;
     }
 
+    bit->second.last_active = std::chrono::steady_clock::now();
+
     std::span<uint8_t> data(bit->second.read_buf.data(), static_cast<size_t>(res));
 
     auto tit = tls_conns_.find(conn_id);
@@ -322,9 +359,31 @@ void Async::IoUringLoop::on_read(uint64_t conn_id, int res) {
     if (tit != tls_conns_.end()) {
         try
         {
+            const bool was_handshake_done = tit->second->handshake_done();
+
             auto to_send = tit->second->feed_encryption(data);
             if (!to_send.empty()) {
                 submit_write(conn_id, std::move(to_send), true);
+            }
+
+            if (!was_handshake_done && tit->second->handshake_done()) {
+                /**
+                 * Order matters here: the handshake's final flight (queued above),
+                 * then anything the session wrote during the handshake (e.g. the
+                 * IMAPS greeting), and only then the client's first command.
+                 * Clients often send that command in the same packet as their
+                 * Finished message, and OpenSSL is still holding it, so it has to
+                 * be read now or it sits there until the client sends more.
+                 */
+                flush_pending_plaintext(conn_id);
+
+                auto again = tls_conns_.find(conn_id);
+                if (again != tls_conns_.end()) {
+                    auto more = again->second->feed_encryption({});
+                    if (!more.empty()) {
+                        submit_write(conn_id, std::move(more), true);
+                    }
+                }
             }
         }
         catch (const std::exception& e)
@@ -431,6 +490,39 @@ void Async::IoUringLoop::on_write(uint64_t conn_id, int res) {
     }
 }
 
+void Async::IoUringLoop::close_idle_connections() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<uint64_t> idle;
+
+    for (const auto& [conn_id, conn] : buffers_) {
+        // A big response still going out to a slow reader isn't idleness
+        if (conn.closing || conn.write_pending) {
+            continue;
+        }
+
+        auto sit = sessions_.find(conn_id);
+        auto limit = (sit != sessions_.end()) ? sit->second->idle_timeout(idle_timeout_) : idle_timeout_;
+
+        if (now - conn.last_active >= limit) {
+            idle.push_back(conn_id);
+        }
+    }
+
+    for (uint64_t conn_id : idle) {
+        auto bit = buffers_.find(conn_id);
+        if (bit == buffers_.end()) {
+            continue;
+        }
+
+        logger.info("[IDLE] conn=" + std::to_string(conn_id) + " from=" + bit->second.ip + " timed out, closing");
+
+        // The pending recv would never complete on a silent socket. Shutting it down
+        // completes the recv with 0, and on_read then finishes the close
+        ::shutdown(bit->second.fd, SHUT_RDWR);
+        submit_close(conn_id);
+    }
+}
+
 void Async::IoUringLoop::flush_write(uint64_t conn_id) {
     logger.debug(
         "[FLUSH_WRITE] conn=" + std::to_string(conn_id) +
@@ -466,6 +558,17 @@ void Async::IoUringLoop::submit_write(uint64_t conn_id, std::vector<uint8_t> dat
     // Only encrypt if the text is plain
     if (!raw) {
         auto tit = tls_conns_.find(conn_id);
+
+        /**
+         * Mid-handshake there is no session key yet. Sending this as-is would
+         * put plaintext on a connection the client expects to be encrypted,
+         * so hold it until the handshake completes.
+         */
+        if (tit != tls_conns_.end() && !tit->second->handshake_done()) {
+            auto& pending = bit->second.pending_plaintext;
+            pending.insert(pending.end(), data.begin(), data.end());
+            return;
+        }
 
         if (tit != tls_conns_.end() && tit->second->handshake_done()) {
             try {
@@ -533,6 +636,12 @@ void Async::IoUringLoop::upgrade_tls(uint64_t conn_id) {
         return;
     }
 
+    logger.info("[TLS] conn=" + std::to_string(conn_id) + " upgrading to TLS");
+
+    attach_tls(conn_id);
+}
+
+void Async::IoUringLoop::attach_tls(uint64_t conn_id) {
     auto tls = std::make_unique<TLS::Connection>(
         tls_ctx_->new_server_ssl(),
         [this, conn_id](std::span<const uint8_t> plain) {
@@ -543,9 +652,19 @@ void Async::IoUringLoop::upgrade_tls(uint64_t conn_id) {
         }
     );
 
-    logger.info("[TLS] conn=" + std::to_string(conn_id) + " upgrading to TLS");
-
     tls_conns_[conn_id] = std::move(tls);
+}
+
+void Async::IoUringLoop::flush_pending_plaintext(uint64_t conn_id) {
+    auto bit = buffers_.find(conn_id);
+    if (bit == buffers_.end() || bit->second.pending_plaintext.empty()) {
+        return;
+    }
+
+    std::vector<uint8_t> pending = std::move(bit->second.pending_plaintext);
+    bit->second.pending_plaintext.clear();
+
+    submit_write(conn_id, std::move(pending));
 }
 
 io_uring_sqe* Async::IoUringLoop::get_sqe() {

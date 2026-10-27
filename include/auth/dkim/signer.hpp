@@ -44,17 +44,27 @@ namespace DKIM {
             Signer& operator=(const Signer&) = delete;
 
             /**
-             * @brief Signs an RFC-5322 message
-             * Returns the original message with a DKIM-Signature header prepended
+             * @brief Signs a header block and body
+             * Returns the header block with a CRLF-terminated DKIM-Signature header appended
              * Throws std::runtime_error on failures
-             * @param raw 
-             * @param envelope_from 
-             * @return std::string 
+             * @param headers header block, ending with its final line break
+             * @param body message body (after the blank line)
+             * @return std::string
              */
             std::string sign(
-                const std::string& raw,
-                const std::string& envelope_from
+                const std::string& headers,
+                const std::string& body
             );
+
+            /**
+             * @brief Signs a complete RFC 5322 message
+             * Returns the message with a DKIM-Signature header added and the
+             * header/body separator intact, ready to send.
+             * Throws std::runtime_error on failures, including a missing separator
+             * @param message
+             * @return std::string
+             */
+            std::string sign_message(const std::string& message);
 
         private:
             Config config_;

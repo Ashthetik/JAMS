@@ -74,6 +74,11 @@ namespace Auth {
         /// @return 
         bool user_exists(const std::string& username);
 
+        /// @brief True if the account exists and has not been deactivated
+        /// @param username
+        /// @return
+        bool is_active_user(const std::string& username);
+
         sqlite3* handle() const {
             return db_;
         }

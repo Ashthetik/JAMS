@@ -14,8 +14,9 @@ using namespace SMTP;
 
 Session::Session(
     uint64_t conn_id, std::string remote_ip,
-    Async::IoUringLoop& loop, Auth::Aliases& aliases
-) : conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), aliases_(aliases) {
+    Async::IoUringLoop& loop, Auth::CredentialStore& cred_store,
+    Auth::Aliases& aliases
+) : conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), cred_store_(cred_store), aliases_(aliases) {
     // RFC-5321 4.2: Send 220 Banner on connect
     reply_code(220, get_hostname() + " ESMTP mailserver/0.1");
     state_ = SMTPState::Greeted; // Wait for EHLO
@@ -211,8 +212,34 @@ void Session::cmd_rcpt(std::string_view arg) {
         return;
     }
 
+    // More than one '@' is never a mailbox we host, and makes the local part ambiguous
+    if (at != std::string::npos && addr.find('@', at + 1) != std::string::npos) {
+        reply_code(501, "5.1.3 Bad recipient address syntax");
+        return;
+    }
+
+    /**
+     * Port 25 only accepts mail for this server's own domain. Anything else
+     * would be relaying, and the local part alone must never decide delivery,
+     * otherwise bob@gmail.com lands in local bob's inbox. A bare local part
+     * (e.g. "postmaster") is treated as addressed to this domain.
+     */
+    std::string local_domain = get_hostname();
+    std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
+
+    if (at != std::string::npos && Auth::Aliases::extract_domain(addr) != local_domain) {
+        reply_code(550, "5.7.1 Relaying denied");
+        return;
+    }
+
     std::string resolved = aliases_.resolve(addr);
     bool is_alias = (resolved != addr);
+
+    // Unknown recipients are refused up front instead of getting a new Maildir created for them
+    if (!is_alias && !cred_store_.is_active_user(local)) {
+        reply_code(550, "5.1.1 Mailbox unavailable");
+        return;
+    }
 
     if (is_alias) {
         logger.warn("[SMTP] treated as alias: addr='" + addr + "'");
