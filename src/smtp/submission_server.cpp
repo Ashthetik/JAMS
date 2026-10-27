@@ -6,6 +6,7 @@
 
 #include <cctype>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <resolv.h>
 #include <netinet/in.h>
@@ -168,10 +169,11 @@ auto SubmissionServer::strip_header(const std::string& body, const std::string& 
         }
 
         if (stripped.empty()) {
-            skipping = false;
+            // End of the header block: the body is copied byte for byte, never filtered
             result += line + "\n";
+            result.append(std::istreambuf_iterator<char>(ss), std::istreambuf_iterator<char>());
 
-            continue;
+            return result;
         }
 
         std::string lower{ stripped };
@@ -550,7 +552,8 @@ bool SubmissionServer::deliver() {
             }
 
             Storage::MailDir mdir(target_path);
-            auto stored_path = mdir.deliver(env_.mail_from, rcpt, env_.body);
+            // Recipients must never see the Bcc list (RFC 5322 3.6.3)
+            auto stored_path = mdir.deliver(env_.mail_from, rcpt, outbound_body);
 
             if (!stored_path) {
                 logger.error("[DELIVER] Failed for: " + rcpt);
@@ -562,7 +565,7 @@ bool SubmissionServer::deliver() {
             }
         }
         else {
-            if (!relay_outbound(env_.mail_from, rcpt, domain, env_.body)) {
+            if (!relay_outbound(env_.mail_from, rcpt, domain, outbound_body)) {
                 logger.error("[DELIVER] Relay failed for: " + rcpt);
                 all_ok = false;
             }
