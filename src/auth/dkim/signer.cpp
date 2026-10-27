@@ -69,7 +69,7 @@ std::string Signer::canonicalize_body(const std::string& body, const std::string
         std::string pending; // Buffer trailing emptiness
 
         while (std::getline(ss, line)) {
-            if (!line.empty()) {
+            if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
 
@@ -101,9 +101,9 @@ std::string Signer::canonicalize_body(const std::string& body, const std::string
             }
         }
 
-        // If the body is empty, treat it as a single CRLF
+        // RFC 6376 3.4.4: with relaxed, an empty body stays empty (simple is the one that becomes CRLF)
         if (result.empty()) {
-            return "\r\n";
+            return "";
         }
 
         return result;
@@ -195,7 +195,8 @@ std::string Signer::canonicalize_header(
         }
 
         // trim leading SP
-        if (size_t start = canon_value.find_first_not_of(' ') != std::string::npos) {
+        const size_t start = canon_value.find_first_not_of(' ');
+        if (start != std::string::npos) {
             canon_value = canon_value.substr(start);
         }
 
@@ -231,7 +232,43 @@ std::string Signer::sign(const std::string& headers, const std::string& body) {
     std::string signing_data = build_signing_data(headers, dkim_header);
     std::string signature = rsa_sha256_sign(signing_data);
 
-    return headers + dkim_header + signature;
+    /**
+     * The header must end with CRLF so the caller's blank line separates the
+     * headers from the body. The base64 signature is folded so the header
+     * stays under the SMTP line limit (RFC 5322 2.1.1); folding whitespace
+     * inside b= is ignored by verifiers (RFC 6376 3.5).
+     */
+    std::string folded_signature;
+    for (size_t i = 0; i < signature.size(); i += 64) {
+        if (i > 0) {
+            folded_signature += "\r\n\t";
+        }
+
+        folded_signature += signature.substr(i, 64);
+    }
+
+    return headers + dkim_header + folded_signature + "\r\n";
+}
+
+std::string Signer::sign_message(const std::string& message) {
+    // Split at the first blank line, accepting CRLF or bare LF line endings
+    const size_t crlf = message.find("\r\n\r\n");
+    const size_t lf = message.find("\n\n");
+
+    std::string headers, body;
+    if (crlf != std::string::npos && (lf == std::string::npos || crlf < lf)) {
+        headers = message.substr(0, crlf + 2);
+        body = message.substr(crlf + 4);
+    }
+    else if (lf != std::string::npos) {
+        headers = message.substr(0, lf + 1);
+        body = message.substr(lf + 2);
+    }
+    else {
+        throw std::runtime_error("[dkim_signer] [ERROR]: No header/body separator found in message");
+    }
+
+    return sign(headers, body) + "\r\n" + body;
 }
 
 std::string Signer::rsa_sha256_sign(const std::string& data) const {
@@ -336,7 +373,13 @@ std::string Signer::build_signing_data(
         signing << canonicalize_header("DKIM-Signature", dkim.substr(16), "simple");
     }
 
-    return signing.str();
+    // RFC 6376 3.7: the DKIM-Signature header is hashed without its trailing CRLF
+    std::string data = signing.str();
+    if (data.size() >= 2 && data.compare(data.size() - 2, 2, "\r\n") == 0) {
+        data.resize(data.size() - 2);
+    }
+
+    return data;
 }
 
 std::unordered_map<std::string, std::vector<std::string>> Signer::parse_headers(
