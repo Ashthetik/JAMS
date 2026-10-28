@@ -107,6 +107,11 @@ namespace Auth {
         /// @param ip 
         void record_failure(const std::string& ip);
 
+        /// @brief Stores the address hash a user last logged in from, so only a change alerts
+        /// @param username 
+        /// @param ip_hash 
+        void remember_ip(const std::string& username, const std::string& ip_hash);
+
         struct HashedPassword {
             std::string hash; // base64 encoded SHA256
             std::string salt; // base64 encoded hash salt
