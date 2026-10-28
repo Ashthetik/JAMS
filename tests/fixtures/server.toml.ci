@@ -14,3 +14,4 @@ dbpath = "/tmp/jams/db/users.db"
 [limits]
 # Short so the idle timeout tests finish quickly
 idle_timeout = 5
+imap_idle_timeout = 15

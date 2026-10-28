@@ -453,11 +453,35 @@ void Async::IoUringLoop::on_write(uint64_t conn_id, int res) {
         return;
     }
 
-    if (!bit->second.write_queue.empty()) {
-        bit->second.write_queue.pop_front();
+    bit->second.write_pending = false;
+
+    /**
+     * send() can take only part of a buffer when the socket's send buffer is full,
+     * which is normal for anything big going to a slow reader. Only drop the
+     * buffer once all of it is out, otherwise send the rest from where it stopped
+     */
+    if (res > 0) {
+        bit->second.last_active = std::chrono::steady_clock::now();
     }
 
-    bit->second.write_pending = false;
+    if (!bit->second.write_queue.empty()) {
+        auto& conn = bit->second;
+        conn.write_offset += static_cast<size_t>(res);
+
+        if (conn.write_offset < conn.write_queue.front().size()) {
+            if (res == 0) {
+                logger.error("[WRITE] conn=" + std::to_string(conn_id) + " send made no progress, closing");
+                submit_close(conn_id);
+                return;
+            }
+
+            flush_write(conn_id);
+            return;
+        }
+
+        conn.write_queue.pop_front();
+        conn.write_offset = 0;
+    }
 
     auto sit = sessions_.find(conn_id);
     if (sit != sessions_.end() && sit->second->wants_tls_upgrade()) {
@@ -476,8 +500,9 @@ void Async::IoUringLoop::on_write(uint64_t conn_id, int res) {
         return;
     }
 
-    // Send the next queued write
-    if (!bit->second.write_queue.empty() && !bit->second.closing) {
+    // Send the next queued write. A closing connection still gets everything it was
+    // already given (e.g. "* BYE" and the tagged OK after LOGOUT) before it closes
+    if (!bit->second.write_queue.empty()) {
         flush_write(conn_id);
     }
     else if (bit->second.closing) {
@@ -495,11 +520,12 @@ void Async::IoUringLoop::close_idle_connections() {
     std::vector<uint64_t> idle;
 
     for (const auto& [conn_id, conn] : buffers_) {
-        // A big response still going out to a slow reader isn't idleness
-        if (conn.closing || conn.write_pending) {
-            continue;
-        }
-
+        /**
+         * Every chunk the kernel takes counts as activity (see on_write), so a slow
+         * reader still pulling a big response stays. One that stopped reading
+         * altogether stalls its write and times out like any other silent client,
+         * including one that was already closing with data still queued
+         */
         auto sit = sessions_.find(conn_id);
         auto limit = (sit != sessions_.end()) ? sit->second->idle_timeout(idle_timeout_) : idle_timeout_;
 
@@ -524,22 +550,25 @@ void Async::IoUringLoop::close_idle_connections() {
 }
 
 void Async::IoUringLoop::flush_write(uint64_t conn_id) {
-    logger.debug(
-        "[FLUSH_WRITE] conn=" + std::to_string(conn_id) +
-        " queue_size=" + std::to_string(buffers_[conn_id].write_queue.size())
-    );
-
+    // find(), not operator[], which would create an empty entry for a connection that's already gone
     auto bit = buffers_.find(conn_id);
     if (bit == buffers_.end() || bit->second.write_queue.empty()) {
         return;
     }
 
+    logger.debug(
+        "[FLUSH_WRITE] conn=" + std::to_string(conn_id) +
+        " queue_size=" + std::to_string(bit->second.write_queue.size())
+    );
+
     bit->second.write_pending = true;
 
+    // Picks up after whatever part of the front buffer an earlier send() already took
+    const auto& front = bit->second.write_queue.front();
     io_uring_sqe* sqe = get_sqe();
     io_uring_prep_send(
-        sqe, bit->second.fd, bit->second.write_queue.front().data(),
-        bit->second.write_queue.front().size(), 0
+        sqe, bit->second.fd, front.data() + bit->second.write_offset,
+        front.size() - bit->second.write_offset, 0
     );
 
     sqe->user_data = encode_userdata(op_type::Write, conn_id);
@@ -587,6 +616,10 @@ void Async::IoUringLoop::submit_write(uint64_t conn_id, std::vector<uint8_t> dat
     // To keep the buffer alive until a completion fires,
     // We store it on the ConnBuffer ans pass a raw pointer to io_uring
     bit->second.write_queue.push_back(std::move(data));
+
+    // Having something to send counts as activity, so time the server spent
+    // building a big response is never charged to the client as silence
+    bit->second.last_active = std::chrono::steady_clock::now();
 
     // Only arm on a new send, if there's no inflight
     if (!bit->second.write_pending) {
