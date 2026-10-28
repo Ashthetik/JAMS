@@ -10,9 +10,16 @@
 #include <openssl/ssl.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <iostream>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -86,58 +93,194 @@ void CredentialStore::ensure_schema() {
         )sql");
 }
 
-void notify_unknown_ip(const std::string& username, const std::string& ip) {
-    const std::string alert_to{ get_ip_reporter() }; // external MTA
-    const std::string alert_from{ "no-reply@" + get_hostname() };
-    const std::string subject{ "JAMS: Unknown IP Login - " + username };
-
-    const std::string body =
-        "An attempted login was detected from an unrecognised IP address.\r\n\r\n"
-        "Username : " + username + "\r\n"
-        "IP       : " + ip + "\r\n";
-
-    const std::string msg =
-        "From: JAMS Security <" + alert_from + ">\r\n"
-        "To:<" + alert_to + ">\r\n"
-        "Subject: " + subject + "\r\n"
-        "MIME-Version: 1.0\r\n"
-        "Content-Type: text/plain\r\n"
-        "\r\n" + body;
-
-    try {
-        struct addrinfo hints {}, * res{ nullptr };
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_family = AF_INET;
-
-        if (getaddrinfo(get_hostname().c_str(), "25", &hints, &res) != 0) {
-            logger.error("[AUTH] [ERROR] notify_unknown_ip: DNS Resolution Failed.");
+namespace {
+    /**
+     * Sends the "login from a new IP" alert. Runs on the alert worker, never on an
+     * event loop: it's a blocking SMTP conversation, and on the IMAP thread an
+     * unreachable server froze mail reading for everyone (H3).
+     * It hands the alert to JAMS's own SMTP listener on loopback, so the configured
+     * ip_alert_mta has to be a local mailbox (port 25 only takes local recipients)
+     */
+    void send_unknown_ip_alert(const std::string& username, const std::string& ip) {
+        const std::string alert_to{ get_ip_reporter() };
+        if (alert_to.empty()) {
+            logger.warn("[AUTH] New IP login for " + username + " from " + ip + ", but [reporting] ip_alert_mta isn't set");
             return;
         }
 
-        int sock = socket(res->ai_family, res->ai_socktype, 0);
-        connect(sock, res->ai_addr, res->ai_addrlen);
-        freeaddrinfo(res);
+        const std::string alert_from{ "no-reply@" + get_hostname() };
+        const std::string msg =
+            "From: JAMS Security <" + alert_from + ">\r\n"
+            "To: <" + alert_to + ">\r\n"
+            "Subject: JAMS: Login from a new IP - " + username + "\r\n"
+            "MIME-Version: 1.0\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "A login was made from an IP address this account hasn't used before.\r\n\r\n"
+            "Username : " + username + "\r\n"
+            "IP       : " + ip + "\r\n";
 
-        auto send_cmd = [&](const std::string& cmd) {
-            send(sock, cmd.c_str(), cmd.size(), 0);
-            char buf[512]{};
-            recv(sock, buf, sizeof(buf) - 1, 0);
+        uint16_t port = 25;
+        if (auto itr = configs.find("smtp"); itr != configs.end()) {
+            try {
+                port = static_cast<uint16_t>(std::stoi(itr->second));
+            }
+            catch (const std::exception&) {
+            }
+        }
+
+        int sock = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (sock < 0) {
+            logger.error("[AUTH] IP alert: socket() failed: " + std::string(strerror(errno)));
+            return;
+        }
+
+        struct timeval tv { .tv_sec = 10, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            logger.error("[AUTH] IP alert: connect to 127.0.0.1:" + std::to_string(port) + " failed: " + std::string(strerror(errno)));
+            ::close(sock);
+            return;
+        }
+
+        std::string pending;
+        // Reads one full reply (all continuation lines) and checks its code
+        auto expect = [&](const char* code) -> bool {
+            while (true) {
+                auto eol = pending.find("\r\n");
+                if (eol != std::string::npos) {
+                    std::string line = pending.substr(0, eol);
+                    pending.erase(0, eol + 2);
+
+                    if (line.size() >= 4 && line[3] == '-') {
+                        continue; // more lines of the same reply
+                    }
+
+                    return line.compare(0, 3, code) == 0;
+                }
+
+                char buf[512];
+                ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+                if (n <= 0) {
+                    return false;
+                }
+
+                pending.append(buf, static_cast<size_t>(n));
+            }
             };
 
-        send_cmd("");  // read banner
-        send_cmd("EHLO mail.detraced.org\r\n");
-        send_cmd("MAIL FROM:<" + alert_from + ">\r\n");
-        send_cmd("RCPT TO:<" + alert_to + ">\r\n");
-        send_cmd("DATA\r\n");
-        send_cmd(msg + "\r\n.\r\n");
-        send_cmd("QUIT\r\n");
+        auto send_all = [&](const std::string& data) -> bool {
+            size_t sent = 0;
+            while (sent < data.size()) {
+                ssize_t n = ::send(sock, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+                if (n <= 0) {
+                    return false;
+                }
+                sent += static_cast<size_t>(n);
+            }
+            return true;
+            };
 
-        close(sock);
+        struct Step {
+            const char* name;
+            std::string line; // empty: just read the server's reply
+            const char* code;
+        };
 
-        logger.info("[AUTH] Unknown IP alert sent for: " + username);
+        const Step steps[] = {
+            { "greeting", "", "220" },
+            { "EHLO", "EHLO " + get_hostname() + "\r\n", "250" },
+            { "MAIL FROM", "MAIL FROM:<" + alert_from + ">\r\n", "250" },
+            { "RCPT TO", "RCPT TO:<" + alert_to + ">\r\n", "250" },
+            { "DATA", "DATA\r\n", "354" },
+            { "message", msg + "\r\n.\r\n", "250" },
+        };
+
+        const char* failed_at = nullptr;
+        for (const auto& step : steps) {
+            if ((!step.line.empty() && !send_all(step.line)) || !expect(step.code)) {
+                failed_at = step.name;
+                break;
+            }
+        }
+
+        send_all("QUIT\r\n");
+        ::close(sock);
+
+        if (failed_at) {
+            logger.error("[AUTH] IP alert for " + username + " to " + alert_to + " failed at " + failed_at);
+        }
+        else {
+            logger.info("[AUTH] New IP alert sent for: " + username);
+        }
     }
-    catch (const std::exception& ex) {
-        logger.error("[AUTH] [ERROR] Failed to send unknown IP alert: " + std::string(ex.what()));
+
+    // One background thread sends the alerts, in order, so a slow mail server only ever delays alerts
+    class AlertWorker {
+    public:
+        AlertWorker() : thread_([this]() { run(); }) {}
+
+        ~AlertWorker() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+            }
+
+            cv_.notify_all();
+            thread_.join();
+        }
+
+        void submit(std::function<void()> job) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                jobs_.push_back(std::move(job));
+            }
+
+            cv_.notify_one();
+        }
+
+    private:
+        void run() {
+            while (true) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [this]() { return stop_ || !jobs_.empty(); });
+
+                    if (jobs_.empty()) {
+                        return; // stopping, and nothing left to send
+                    }
+
+                    job = std::move(jobs_.front());
+                    jobs_.pop_front();
+                }
+
+                try {
+                    job();
+                }
+                catch (const std::exception& ex) {
+                    logger.error("[AUTH] IP alert worker: " + std::string(ex.what()));
+                }
+            }
+        }
+
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        std::deque<std::function<void()>> jobs_;
+        bool stop_{ false };
+        std::thread thread_; // last, so it starts after everything it uses
+    };
+
+    void notify_unknown_ip(const std::string& username, const std::string& ip) {
+        static AlertWorker worker;
+        worker.submit([username, ip]() { send_unknown_ip_alert(username, ip); });
     }
 }
 
@@ -284,8 +427,15 @@ bool CredentialStore::verify(const std::string& username, const std::string& pas
         }
 
         // The IP hash is another full PBKDF2 run, so only a correct password earns it
-        if (!stored_ip.empty() && hash_data(ip).hash != stored_ip) {
-            notify_unknown_ip(username, ip);
+        std::string ip_hash = hash_data(ip).hash;
+
+        if (ip_hash != stored_ip) {
+            // The first login just records the address; after that, only a change alerts
+            if (!stored_ip.empty()) {
+                notify_unknown_ip(username, ip);
+            }
+
+            remember_ip(username, ip_hash);
         }
 
         return true;
@@ -341,6 +491,23 @@ void CredentialStore::record_failure(const std::string& ip) {
     if (++window.count == MAX_AUTH_FAILURES) {
         logger.warn("[AUTH] " + ip + " reached " + std::to_string(MAX_AUTH_FAILURES) + " failed logins, refusing it for the rest of the window");
     }
+}
+
+void CredentialStore::remember_ip(const std::string& username, const std::string& ip_hash) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "UPDATE users SET last_known_ip = ? WHERE username = ?", -1, &stmt, nullptr) != SQLITE_OK) {
+        logger.error("[AUTH] remember_ip prepare failed: " + std::string(sqlite3_errmsg(db_)));
+        return;
+    }
+
+    sqlite3_bind_text(stmt, 1, ip_hash.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        logger.error("[AUTH] remember_ip failed: " + std::string(sqlite3_errmsg(db_)));
+    }
+
+    sqlite3_finalize(stmt);
 }
 
 bool CredentialStore::deactivate_user(const std::string& username) {
