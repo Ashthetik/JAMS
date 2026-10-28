@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <cassert>
+#include <sys/eventfd.h>
 
 Async::IoUringLoop::IoUringLoop(
     uint16_t port, SessionFactory factory, bool implicit_tls, unsigned queue_depth
@@ -60,12 +61,29 @@ Async::IoUringLoop::IoUringLoop(
     max_connections_ = get_limit("max_connections", 200);
     max_connections_per_ip_ = get_limit("max_connections_per_ip", 20);
 
+    post_queue_->event_fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (post_queue_->event_fd < 0) {
+        throw std::runtime_error(std::string("eventfd(): ") + strerror(errno));
+    }
+
     setup_listen_socket();
 }
 
 static_assert(sizeof(SMTP::Session) > 0);
 
 Async::IoUringLoop::~IoUringLoop() {
+    {
+        // Workers may still hold a Poster; from here on their tasks are dropped
+        std::lock_guard<std::mutex> lock(post_queue_->mutex);
+        post_queue_->open = false;
+        post_queue_->tasks.clear();
+
+        if (post_queue_->event_fd >= 0) {
+            ::close(post_queue_->event_fd);
+            post_queue_->event_fd = -1;
+        }
+    }
+
     if (ring_initialized_) {
         io_uring_queue_exit(&ring_);
         if (listen_fd_ >= 0) {
@@ -182,6 +200,7 @@ void Async::IoUringLoop::arm_accept() {
 
 void Async::IoUringLoop::run() {
     arm_accept();
+    arm_wakeup();
 
     // Without this, a client that connects and says nothing holds its slot forever
     arm_periodic_timer(std::chrono::seconds(1), [this]() {
@@ -244,6 +263,9 @@ void Async::IoUringLoop::run() {
                 break;
             case op_type::Timer:
                 on_timer(conn_id, res);
+                break;
+            case op_type::Wakeup:
+                on_wakeup(res);
                 break;
             }
         }
@@ -665,6 +687,55 @@ void Async::IoUringLoop::flush_pending_plaintext(uint64_t conn_id) {
     bit->second.pending_plaintext.clear();
 
     submit_write(conn_id, std::move(pending));
+}
+
+Async::IoUringLoop::Poster Async::IoUringLoop::poster() const {
+    return [queue = post_queue_](std::function<void()> task) {
+        std::lock_guard<std::mutex> lock(queue->mutex);
+        if (!queue->open) {
+            return;
+        }
+
+        queue->tasks.push_back(std::move(task));
+
+        uint64_t one = 1;
+        if (::write(queue->event_fd, &one, sizeof(one)) < 0 && errno != EAGAIN) {
+            logger.error("[IO_URING] wakeup write failed: " + std::string(strerror(errno)));
+        }
+        };
+}
+
+void Async::IoUringLoop::arm_wakeup() {
+    io_uring_sqe* sqe = get_sqe();
+    io_uring_prep_read(sqe, post_queue_->event_fd, &wakeup_buf_, sizeof(wakeup_buf_), 0);
+    sqe->user_data = encode_userdata(op_type::Wakeup, 0);
+    submit();
+}
+
+void Async::IoUringLoop::on_wakeup(int res) {
+    if (res < 0 && res != -EAGAIN && res != -EINTR) {
+        logger.error("[IO_URING] wakeup read failed: " + std::string(strerror(-res)));
+    }
+
+    std::vector<std::function<void()>> tasks;
+    {
+        std::lock_guard<std::mutex> lock(post_queue_->mutex);
+        tasks.swap(post_queue_->tasks);
+    }
+
+    // Run outside the lock: a task may well post again
+    for (auto& task : tasks) {
+        try {
+            task();
+        }
+        catch (const std::exception& ex) {
+            logger.error("[IO_URING] posted task threw: " + std::string(ex.what()));
+        }
+    }
+
+    if (!g_shutdown) {
+        arm_wakeup();
+    }
 }
 
 io_uring_sqe* Async::IoUringLoop::get_sqe() {
