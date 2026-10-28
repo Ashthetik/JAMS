@@ -52,7 +52,7 @@ std::optional<std::string> MailDir::deliver(
 
     if (!ensured_dirs) {
         logger.error("[MAILDIR] Failed to ensure directories exist");
-        return "";
+        return std::nullopt;
     }
 
     // Building the mesasge
@@ -63,7 +63,7 @@ std::optional<std::string> MailDir::deliver(
 
     if (localtime_r(&now_t, &tm_buf) == nullptr) {
         logger.error("[MAILDIR] localtime_r failed: " + std::string(strerror(errno)));
-        return "";
+        return std::nullopt;
     }
 
     // RFC-2822 date format:
@@ -85,13 +85,13 @@ std::optional<std::string> MailDir::deliver(
         std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
         if (!ofs) {
             logger.error("[MAILDIR] open(" + std::string(tmp_path.c_str()) + ") failed: " + std::string(strerror(errno)));
-            return "";
+            return std::nullopt;
         }
 
         ofs.write(message.data(), static_cast<std::streamsize>(message.size()));
         if (!ofs) {
             logger.error("[MAILDIR] Write failed for: " + std::string(tmp_path.c_str()));
-            return "";
+            return std::nullopt;
         }
 
         ofs.flush();
@@ -110,7 +110,7 @@ std::optional<std::string> MailDir::deliver(
         logger.error("[MAILDIR] Rename to new/ failed: " + ec.message());
 
         std::filesystem::remove(tmp_path, ec);
-        return "";
+        return std::nullopt;
     }
 
     logger.info("[MAILDIR] Delivered to " + std::string(new_path.c_str()));
