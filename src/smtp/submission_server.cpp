@@ -232,7 +232,15 @@ void SubmissionServer::process_line(std::string_view line) {
         c = static_cast<char>(std::toupper(c));
     }
 
-    logger.debug("[SUBMISSION]: " + std::to_string(conn_id_) + std::string(line));
+    // AUTH PLAIN carries base64 credentials on the same line, so never log what follows the mechanism
+    if (verb == "AUTH") {
+        auto mech_end = arg.find(' ');
+        logger.debug("[SUBMISSION]: " + std::to_string(conn_id_) + " AUTH " + std::string(arg.substr(0, mech_end))
+            + (mech_end != std::string_view::npos ? " [credentials hidden]" : ""));
+    }
+    else {
+        logger.debug("[SUBMISSION]: " + std::to_string(conn_id_) + std::string(line));
+    }
 
     if (verb == "EHLO") {
         cmd_ehlo(arg);

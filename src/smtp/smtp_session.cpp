@@ -93,7 +93,13 @@ void Session::process_line(std::string_view line) {
         c = static_cast<char>(std::toupper(c));
     }
 
-    logger.debug("[SMTP] " + std::to_string(conn_id_) + std::string(line));
+    // Port 25 doesn't offer AUTH, but a client can still send its credentials here
+    if (verb == "AUTH") {
+        logger.debug("[SMTP] " + std::to_string(conn_id_) + " AUTH [credentials hidden]");
+    }
+    else {
+        logger.debug("[SMTP] " + std::to_string(conn_id_) + std::string(line));
+    }
 
     if (verb == "EHLO") {
         cmd_ehlo(arg);
