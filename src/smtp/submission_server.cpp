@@ -42,7 +42,17 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
         if (state_ == State::Data) {
             // in DATA mode, accumulate the raw bytes
             // and detect teh EOD sequence: CRLF.CRLF
-            line_buf_ += static_cast<char>(b);
+            // Past the size limit stop storing, and only watch for the end: the 552
+            // can't be sent until the sender finishes (RFC 5321 4.2.5)
+            if (!data_too_big_) {
+                line_buf_ += static_cast<char>(b);
+
+                if (line_buf_.size() > MAX_MESSAGE_SIZE + 5) {
+                    data_too_big_ = true;
+                    line_buf_.clear();
+                    line_buf_.shrink_to_fit();
+                }
+            }
 
             data_tail_ += static_cast<char>(b);
             if (data_tail_.size() > 5) {
@@ -50,6 +60,16 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
             }
 
             if (data_tail_ == "\r\n.\r\n") {
+                if (data_too_big_) {
+                    data_too_big_ = false;
+                    data_tail_.clear();
+
+                    reply(552, "5.3.4 Message size exceeds fixed maximum message size");
+                    state_ = State::Authenticated;
+                    env_ = {};
+                    continue;
+                }
+
                 env_.body = line_buf_.substr(
                     0, line_buf_.size() - 5
                 ); // remove the "\r\n.\r\n"
@@ -281,7 +301,7 @@ void SubmissionServer::cmd_ehlo(std::string_view arg) {
         get_hostname() + " greets " + client_helo_,
         "8BITMIME",
         "PIPELINING",
-        "SIZE 52428800"
+        "SIZE " + std::to_string(MAX_MESSAGE_SIZE)
     };
 
     if (loop_.is_tls_active(conn_id_)) {
@@ -485,6 +505,11 @@ void SubmissionServer::cmd_mail(std::string_view arg) {
     }
 
     auto addr = std::string(extract_address(arg.substr(5)));
+
+    if (declared_size_too_big(upper)) {
+        reply(552, "5.3.4 Message size exceeds fixed maximum message size");
+        return;
+    }
 
     // RFC 6409 6.1: the MSA may only accept senders the authenticated user is allowed to use
     if (!owns_address(addr)) {

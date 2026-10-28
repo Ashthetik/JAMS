@@ -4,14 +4,40 @@
 #include "io/io_uring_loop.hpp"
 #include "auth/credentials/aliases.hpp"
 
+#include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <span>
 
 namespace Async { class IoUringLoop; };
 
 namespace SMTP {
+    /// @brief Largest message accepted on 25 and 587, advertised as SIZE in EHLO (RFC 1870)
+    inline constexpr size_t MAX_MESSAGE_SIZE = 52428800;
+
+    /// @brief True if MAIL FROM declares a SIZE= over MAX_MESSAGE_SIZE (RFC 1870 6.1)
+    /// @param upper_args The MAIL arguments, uppercased
+    inline bool declared_size_too_big(std::string_view upper_args) {
+        auto pos = upper_args.find(" SIZE=");
+        if (pos == std::string_view::npos) {
+            return false;
+        }
+
+        pos += 6;
+        size_t end = pos;
+        while (end < upper_args.size() && std::isdigit(static_cast<unsigned char>(upper_args[end]))) {
+            ++end;
+        }
+
+        uint64_t declared = 0;
+        auto [ptr, ec] = std::from_chars(upper_args.data() + pos, upper_args.data() + end, declared);
+
+        return ec == std::errc::result_out_of_range || (ec == std::errc{} && declared > MAX_MESSAGE_SIZE);
+    }
+
     enum class SMTPState {
         Connected,
         Greeted,
@@ -137,6 +163,7 @@ namespace SMTP {
         std::string client_helo_;
 
         std::string data_tail_;
+        bool data_too_big_{ false }; // past MAX_MESSAGE_SIZE: stop storing, wait for the end, then 552
         bool tls_upgrade_pending_ = false;
     };
 
