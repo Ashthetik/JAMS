@@ -7,10 +7,13 @@
 #include "smtp/smtp_session.hpp"
 #include "auth/credentials/aliases.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Async { class IoUringLoop; };
 
@@ -38,6 +41,8 @@ namespace SMTP
             uint64_t conn_id, const std::string& remote_ip,
             Async::IoUringLoop& loop, Auth::CredentialStore& store,
             Auth::Aliases& aliases);
+
+        ~SubmissionServer();
 
         /// @brief Called by io_uring when bytes arrive
         /// @param bytes
@@ -67,8 +72,16 @@ namespace SMTP
         {
             tls_upgrade_pending_ = false;
         }
+
+        /// @brief While a relay is out the client is waiting on us, not idle, and the
+        /// relay's own socket timeouts bound how long that can take
+        std::chrono::seconds idle_timeout(std::chrono::seconds fallback) const override
+        {
+            return relay_pending_ ? std::chrono::hours(24) : fallback;
+        }
     private:
-        DKIM::Signer dkim_signer_;
+        // Shared with relay jobs, which can outlive the session if the client hangs up
+        std::shared_ptr<DKIM::Signer> dkim_signer_;
 
         /// @brief Helper overload function to extract email addresses from a body
         /// used when handling BCC/CC
@@ -94,9 +107,22 @@ namespace SMTP
         /// @return
         bool from_header_owned(const std::string& message);
 
-        bool relay_outbound(
+        /// @brief Delivers one message to one external recipient. Blocking, so it only
+        /// ever runs on a relay worker thread, never on the event loop
+        static bool relay_outbound(
+            DKIM::Signer& signer,
             const std::string& from, const std::string& to,
             const std::string& domain, const std::string& body);
+
+        /// @brief Hands the external recipients to a relay worker. The client's reply
+        /// waits for the result, everyone else on this loop doesn't
+        void start_relay(
+            bool local_ok, std::vector<std::pair<std::string, std::string>> external,
+            std::string body);
+
+        /// @brief Called back on the loop thread once the relay is done: replies, then
+        /// runs whatever the client pipelined in the meantime
+        void finish_relay(bool ok);
 
         /// @brief Processes commands received from on-wire data
         /// @param line
@@ -146,9 +172,11 @@ namespace SMTP
         /// @param lines
         void reply_multiline(int code, const std::vector<std::string>& lines);
 
-        /// @brief Delivers mail to the recipient
-        /// @return
-        bool deliver();
+        /// @brief Delivers mail to local recipients and collects the external ones
+        /// @param external Filled with (recipient, domain) pairs to relay
+        /// @param relay_body Filled with the message to relay, Bcc already stripped
+        /// @return false if any local delivery failed
+        bool deliver(std::vector<std::pair<std::string, std::string>>& external, std::string& relay_body);
 
         /// @brief Trims unwanted data from the given string
         /// @param sv
@@ -197,5 +225,9 @@ namespace SMTP
         std::string client_helo_;
 
         bool tls_upgrade_pending_ = false;
+
+        bool relay_pending_{ false };
+        std::string held_input_; // bytes pipelined while a relay is out
+        std::shared_ptr<bool> alive_{ std::make_shared<bool>(true) }; // false once the session is gone
     };
 }
