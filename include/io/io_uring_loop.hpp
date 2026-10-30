@@ -189,6 +189,7 @@ namespace Async {
             std::chrono::steady_clock::time_point last_active{ std::chrono::steady_clock::now() };
             std::vector<uint8_t> read_buf;
             std::deque<std::vector<uint8_t>> write_queue;
+            size_t write_offset{ 0 }; // bytes of write_queue.front() the kernel has already taken
             bool write_pending{ false };
             bool closing{ false };
             int inflight{ 0 };
