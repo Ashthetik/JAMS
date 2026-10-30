@@ -18,6 +18,7 @@
 #include <span>
 #include <vector>
 #include <deque>
+#include <mutex>
 
 /// @brief Operation Types for io_uring
 enum class op_type : uint8_t {
@@ -26,6 +27,7 @@ enum class op_type : uint8_t {
     Write = 2,
     Close = 3,
     Timer = 4,
+    Wakeup = 5,
 };
 
 /// @brief Encodes data to ensure integrity and avoid dangling references
@@ -118,9 +120,33 @@ namespace Async {
             return implicit_tls_;
         }
 
+        /// @brief Hands a task to this loop from any thread. Used by work that runs off the
+        /// loop (e.g. outbound relay) to report back. Safe to call after the loop is gone:
+        /// the task is simply dropped
+        using Poster = std::function<void(std::function<void()>)>;
+        Poster poster() const;
+
         void arm_periodic_timer(std::chrono::seconds interval, std::function<void()> callback);
 
     private:
+        /// @brief Tasks posted from other threads, plus the eventfd that wakes the loop for them.
+        /// Shared so a Poster held by a worker outlives the loop safely
+        struct PostQueue {
+            std::mutex mutex;
+            std::vector<std::function<void()>> tasks;
+            int event_fd{ -1 };
+            bool open{ true };
+        };
+
+        std::shared_ptr<PostQueue> post_queue_{ std::make_shared<PostQueue>() };
+        uint64_t wakeup_buf_{ 0 };
+
+        /// @brief Arms a read on the eventfd so a post() wakes io_uring
+        void arm_wakeup();
+
+        /// @brief Runs everything posted since the last wakeup, then re-arms
+        void on_wakeup(int res);
+
         /// @brief Closes connections that have been silent longer than their session's idle timeout
         void close_idle_connections();
 

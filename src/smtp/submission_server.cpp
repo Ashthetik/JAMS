@@ -15,19 +15,102 @@
 #include <netdb.h>
 #include <sstream>
 #include <filesystem>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 using namespace SMTP;
+
+namespace {
+    /**
+     * Outbound relays run here instead of on the 587 event loop. A relay is a
+     * blocking SMTP conversation with 30 second timeouts, so on the loop one
+     * slow or dead remote server froze submission for every user
+     */
+    class RelayWorkers {
+    public:
+        explicit RelayWorkers(size_t count) {
+            for (size_t i = 0; i < count; ++i) {
+                threads_.emplace_back([this]() { run(); });
+            }
+        }
+
+        ~RelayWorkers() {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+            }
+
+            cv_.notify_all();
+            for (auto& t : threads_) {
+                t.join();
+            }
+        }
+
+        void submit(std::function<void()> job) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                jobs_.push_back(std::move(job));
+            }
+
+            cv_.notify_one();
+        }
+
+    private:
+        void run() {
+            while (true) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [this]() { return stop_ || !jobs_.empty(); });
+
+                    if (stop_ && jobs_.empty()) {
+                        return;
+                    }
+
+                    job = std::move(jobs_.front());
+                    jobs_.pop_front();
+                }
+
+                try {
+                    job();
+                }
+                catch (const std::exception& ex) {
+                    logger.error("[RELAY] worker job threw: " + std::string(ex.what()));
+                }
+            }
+        }
+
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        std::deque<std::function<void()>> jobs_;
+        std::vector<std::thread> threads_;
+        bool stop_{ false };
+    };
+
+    RelayWorkers& relay_workers() {
+        static RelayWorkers workers(4);
+        return workers;
+    }
+}
 
 SubmissionServer::SubmissionServer(
     uint64_t conn_id, const std::string& remote_ip,
     Async::IoUringLoop& loop, Auth::CredentialStore& store,
     Auth::Aliases& aliases
-) : dkim_signer_({
+) : dkim_signer_(std::make_shared<DKIM::Signer>(DKIM::Signer::Config{
         .domain = get_hostname(),
         .selector = "jams",
         .priv_key_path = "/etc/jams/tls/key.pem"
-    }), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), sasl_(store, remote_ip), aliases_(aliases) {
+    })), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), sasl_(store, remote_ip), aliases_(aliases) {
     reply(220, get_hostname() + " ESMTP submission");
+}
+
+SubmissionServer::~SubmissionServer() {
+    // A relay finishing after this must not touch the session
+    *alive_ = false;
 }
 
 void SubmissionServer::on_tls_established() {
@@ -38,7 +121,14 @@ void SubmissionServer::on_tls_established() {
 }
 
 void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
-    for (uint8_t b : bytes) {
+    // While a relay is out, hold whatever the client pipelined after the message
+    if (relay_pending_) {
+        held_input_.append(bytes.begin(), bytes.end());
+        return;
+    }
+
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        uint8_t b = bytes[i];
         if (state_ == State::Data) {
             // in DATA mode, accumulate the raw bytes
             // and detect teh EOD sequence: CRLF.CRLF
@@ -64,11 +154,28 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
                 if (!from_header_owned(env_.body)) {
                     reply(550, "5.7.1 From header must only contain addresses you own");
                 }
-                else if (deliver()) {
-                    reply(250, "OK: Message Accepted");
-                }
                 else {
-                    reply(452, "Insufficient Storage");
+                    std::vector<std::pair<std::string, std::string>> external;
+                    std::string relay_body;
+                    bool local_ok = deliver(external, relay_body);
+
+                    if (!external.empty()) {
+                        start_relay(local_ok, std::move(external), std::move(relay_body));
+
+                        state_ = State::Authenticated;
+                        env_ = {};
+
+                        // Anything after the message waits for the relay's reply
+                        held_input_.append(bytes.begin() + i + 1, bytes.end());
+                        return;
+                    }
+
+                    if (local_ok) {
+                        reply(250, "OK: Message Accepted");
+                    }
+                    else {
+                        reply(452, "Insufficient Storage");
+                    }
                 }
 
                 state_ = State::Authenticated;
@@ -604,7 +711,7 @@ void SubmissionServer::cmd_quit() {
     loop_.submit_close(conn_id_);
 }
 
-bool SubmissionServer::deliver() {
+bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>& external, std::string& relay_body) {
     // TODO: Encrypt before writing
     bool all_ok = true;
     std::string local_domain = get_hostname();
@@ -632,6 +739,7 @@ bool SubmissionServer::deliver() {
     }
 
     std::string outbound_body = strip_header(env_.body, "bcc");
+    relay_body = outbound_body;
 
     for (const auto& rcpt : all_rcpts) {
         // Extract local/account name (before @)
@@ -694,17 +802,62 @@ bool SubmissionServer::deliver() {
             }
         }
         else {
-            if (!relay_outbound(env_.mail_from, rcpt, domain, outbound_body)) {
-                logger.error("[DELIVER] Relay failed for: " + rcpt);
-                all_ok = false;
-            }
+            // Relayed off the event loop, see start_relay()
+            external.emplace_back(rcpt, domain);
         }
     }
 
     return all_ok;
 }
 
+void SubmissionServer::start_relay(
+    bool local_ok, std::vector<std::pair<std::string, std::string>> external,
+    std::string body
+) {
+    relay_pending_ = true;
+
+    relay_workers().submit([
+        post = loop_.poster(), signer = dkim_signer_, alive = alive_, this,
+        local_ok, external = std::move(external), body = std::move(body), from = env_.mail_from
+    ]() {
+        bool ok = local_ok;
+
+        for (const auto& [rcpt, domain] : external) {
+            if (!relay_outbound(*signer, from, rcpt, domain, body)) {
+                logger.error("[DELIVER] Relay failed for: " + rcpt);
+                ok = false;
+            }
+        }
+
+        // Back to the loop thread. Only touch the session there, and only if it's still around
+        post([alive, this, ok]() {
+            if (*alive) {
+                finish_relay(ok);
+            }
+            });
+        });
+}
+
+void SubmissionServer::finish_relay(bool ok) {
+    relay_pending_ = false;
+
+    if (ok) {
+        reply(250, "OK: Message Accepted");
+    }
+    else {
+        reply(452, "Insufficient Storage");
+    }
+
+    if (!held_input_.empty()) {
+        std::string held = std::move(held_input_);
+        held_input_.clear();
+
+        on_data(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(held.data()), held.size()));
+    }
+}
+
 bool SubmissionServer::relay_outbound(
+    DKIM::Signer& signer,
     const std::string& from, const std::string& to,
     const std::string& domain, const std::string& body
 ) {
@@ -1053,7 +1206,7 @@ bool SubmissionServer::relay_outbound(
 
     if (ok) {
         try {
-            outbound = dkim_signer_.sign_message(body);
+            outbound = signer.sign_message(body);
             logger.debug("[RELAY] Signed message:\n" + outbound);
         }
         catch (const std::exception& e) {
