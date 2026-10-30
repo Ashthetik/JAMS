@@ -955,7 +955,23 @@ std::vector<uint8_t> Session::read_blob(const MessageMeta& msg) const {
         return {};
     }
 
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    // One sized read. Going through istreambuf_iterator copied a byte at a time,
+    // which held up every IMAP user on this thread for the length of a big FETCH
+    file.seekg(0, std::ios::end);
+    std::streamoff size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    if (size <= 0) {
+        return {};
+    }
+
+    std::vector<uint8_t> blob(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(blob.data()), size)) {
+        logger.error("[IMAP] Short read on " + path);
+        blob.resize(static_cast<size_t>(file.gcount()));
+    }
+
+    return blob;
 }
 
 std::string Session::build_envelope(const MessageMeta& /* msg */) const {
