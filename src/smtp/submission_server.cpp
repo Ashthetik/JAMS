@@ -795,6 +795,9 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
             if (!stored_path) {
                 logger.error("[DELIVER] Failed for: " + rcpt);
                 all_ok = false;
+
+                // Nothing was stored, so there's nothing for an alias purge to point at
+                continue;
             }
 
             if (target != rcpt) {

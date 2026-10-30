@@ -43,12 +43,15 @@ void Session::on_data(std::span<const uint8_t> bytes) {
 
                 if (deliver()) {
                     reply_code(250, "OK: Message Accepted");
-                    state_ = SMTPState::Greeted;
-                    env_ = {};
                 }
                 else {
                     reply_code(452, "Insufficient Storage");
                 }
+
+                // Either way the transaction is over. Staying in Data after a 452
+                // would read the sender's next commands as message text
+                state_ = SMTPState::Greeted;
+                env_ = {};
             }
         }
         else {
@@ -368,8 +371,10 @@ bool Session::deliver() {
 
     for (const auto& rcpt : env_.rcpt_to) {
         // Extract local/account name (before @)
-        auto at = rcpt.find('@');
+        // Cut at the '@' in the resolved target, not in rcpt: an alias and its target
+        // are different lengths, and cutting at rcpt's offset picked the wrong mailbox
         std::string target = aliases_.resolve(rcpt);
+        auto at = target.find('@');
         std::string mailbox_user = (at != std::string::npos) ? target.substr(0, at) : target;
 
         if (!Storage::MailDir::is_safe(mailbox_user)) {
@@ -399,6 +404,9 @@ bool Session::deliver() {
         if (!stored_path) {
             logger.error("[DELIVER] Failed for: " + rcpt);
             all_ok = false;
+
+            // Nothing was stored, so there's nothing for an alias purge to point at
+            continue;
         }
 
         if (target != rcpt) {
