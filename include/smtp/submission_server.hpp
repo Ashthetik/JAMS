@@ -210,6 +210,7 @@ namespace SMTP
         bool tls_active_{ false };
         std::string line_buf_;
         std::string data_tail_;
+        bool data_too_big_{ false }; // past MAX_MESSAGE_SIZE: stop storing, wait for the end, then 552
 
         bool pending_close_{ false };
 
