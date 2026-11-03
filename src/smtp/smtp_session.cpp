@@ -168,13 +168,24 @@ void Session::cmd_mail(std::string_view arg) {
         return;
     }
 
+    /**
+     * RFC 5321 4.5.5: "<>" is the null reverse path, and it is what every bounce
+     * and delivery status notification is sent with so that a bounce can never
+     * bounce. It must be accepted. A missing or malformed argument extracts to an
+     * empty address too, so tell the two apart on the raw path before the check.
+     */
+    auto reverse_path = trim(arg.substr(5));
+    if (auto sp = reverse_path.find(' '); sp != std::string_view::npos) {
+        reverse_path = reverse_path.substr(0, sp); // drop ESMTP parameters
+    }
+
     auto addr = std::string(extract_address(arg.substr(5)));
-    if (addr.empty()) {
+    if (addr.empty() && reverse_path != "<>") {
         reply_code(501, "Empty MAIL FROM:<...>");
         return;
     }
 
-    env_.mail_from = std::string(extract_address(arg.substr(5)));
+    env_.mail_from = addr;
     state_ = SMTPState::Mail;
     reply_code(250, "OK");
 }
