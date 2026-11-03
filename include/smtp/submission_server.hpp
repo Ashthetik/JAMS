@@ -191,6 +191,7 @@ namespace SMTP
         uint64_t conn_id_;
         std::string remote_ip_;
         Async::IoUringLoop& loop_;
+        Auth::CredentialStore& cred_store_;
         Auth::SASLSession sasl_;
         Auth::Aliases& aliases_;
 

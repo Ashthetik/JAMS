@@ -94,6 +94,41 @@ namespace {
         static RelayWorkers workers(4);
         return workers;
     }
+
+    /**
+     * True if a recipient domain names an address rather than a host.
+     *
+     * A relay destination has to be a hostname: if a bare IP or an RFC 5321
+     * address literal is allowed through, an authenticated user picks which
+     * address the server dials out to on port 25, internal ones included.
+     *
+     * inet_aton() is deliberately the IPv4 test rather than inet_pton(): it is
+     * what getaddrinfo() itself parses for a numeric host, so the short and
+     * non-decimal spellings ("127.1", "2130706433", "0x7f000001") are caught
+     * along with the dotted quad.
+     */
+    bool is_address_destination(const std::string& domain) {
+        if (domain.empty()) {
+            return false;
+        }
+
+        // "[127.0.0.1]", "[IPv6:::1]"
+        if (domain.front() == '[' || domain.back() == ']') {
+            return true;
+        }
+
+        struct in_addr v4 {};
+        if (::inet_aton(domain.c_str(), &v4) != 0) {
+            return true;
+        }
+
+        struct in6_addr v6 {};
+        if (::inet_pton(AF_INET6, domain.c_str(), &v6) == 1) {
+            return true;
+        }
+
+        return false;
+    }
 }
 
 SubmissionServer::SubmissionServer(
@@ -104,7 +139,8 @@ SubmissionServer::SubmissionServer(
         .domain = get_hostname(),
         .selector = "jams",
         .priv_key_path = "/etc/jams/tls/key.pem"
-    })), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), sasl_(store, remote_ip), aliases_(aliases) {
+    })), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), cred_store_(store),
+        sasl_(store, remote_ip), aliases_(aliases) {
     reply(220, get_hostname() + " ESMTP submission");
 }
 
@@ -636,16 +672,23 @@ void SubmissionServer::cmd_rcpt(std::string_view arg) {
 
     auto at = addr.find('@');
     const std::string domain = (at != std::string::npos) ? addr.substr(at + 1) : "";
+    const std::string local = (at != std::string::npos) ? addr.substr(0, at) : addr;
     std::string domain_lower = domain;
     std::transform(domain_lower.begin(), domain_lower.end(), domain_lower.begin(), ::tolower);
+
+    std::string local_domain = get_hostname();
+    std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
+
+    // Anything we would have to relay has to name a host, never an address
+    if (domain_lower != local_domain && is_address_destination(domain_lower)) {
+        reply(550, "5.7.1 Relaying to an IP address is not allowed");
+        return;
+    }
 
     if (!Storage::MailDir::is_safe(domain_lower)) {
         reply(550, "Mailbox unavailable");
         return;
     }
-
-    std::string local_domain = get_hostname();
-    std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
 
     /**
      * This is the submission port: RCPT is only reachable after AUTH and MAIL,
@@ -661,6 +704,12 @@ void SubmissionServer::cmd_rcpt(std::string_view arg) {
 
     std::string resolved = aliases_.resolve(addr);
     bool is_alias = (resolved != addr);
+
+    // Unknown local recipients are refused up front instead of getting a new Maildir created for them
+    if (!is_alias && !cred_store_.is_active_user(local)) {
+        reply(550, "5.1.1 Mailbox unavailable");
+        return;
+    }
 
     if (is_alias) {
         if (!aliases_.accept_and_consume(addr)) {
