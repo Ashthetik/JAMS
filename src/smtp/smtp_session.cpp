@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <span>
@@ -337,10 +338,11 @@ auto Session::strip_header(const std::string& body, const std::string& header_na
         }
 
         if (stripped.empty()) {
-            skipping = false;
+            // End of the header block: the body is copied byte for byte, never filtered
             result += line + "\n";
+            result.append(std::istreambuf_iterator<char>(ss), std::istreambuf_iterator<char>());
 
-            continue;
+            return result;
         }
 
         std::string lower{ stripped };
