@@ -34,6 +34,11 @@ namespace Async { class IoUringLoop; };
 //   before TLS is established, we respond with 538 (encryption required).
 namespace SMTP
 {
+    /// @brief Breaks every outbound relay socket still in flight and waits for the relay
+    /// workers to finish. Call it during shutdown: a worker blocked on a dead or slow
+    /// remote server cannot see a stop flag, so its socket has to be broken from outside
+    void stop_relay_workers();
+
     class SubmissionServer : public ISession
     {
     public:
