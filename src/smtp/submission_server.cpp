@@ -211,6 +211,14 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
     }
 }
 
+/**
+ * RFC 5321 4.5.3 caps a transaction at 100 recipients and cmd_rcpt enforces that on the
+ * envelope. Cc/Bcc collection adds recipients the envelope never named, so it answers to
+ * the same ceiling and one message never fans out past it. Uncapped, a single header line
+ * full of addresses would turn into that many local deliveries.
+ */
+constexpr size_t kMaxRecipients = 100;
+
 auto SubmissionServer::extract_address(const std::string& body, const std::string& header_name) {
     std::vector<std::string> addresses = {};
     std::istringstream ss(body);
@@ -218,11 +226,14 @@ auto SubmissionServer::extract_address(const std::string& body, const std::strin
     bool in_header{ false };
 
     while (std::getline(ss, line)) {
-        if (line.empty() && line.back() == '\r') {
+        // back() on an empty line reads data()[-1], so the guard has to be !empty()
+        if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
 
         if (line.empty()) {
+            // End of the header block. The body is never scanned for headers,
+            // so a "Cc:" line quoted in a reply is text, not a recipient.
             break;
         }
 
@@ -263,6 +274,10 @@ auto SubmissionServer::extract_address(const std::string& body, const std::strin
 
                 if (!token.empty()) {
                     addresses.push_back(token);
+
+                    if (addresses.size() >= kMaxRecipients) {
+                        return addresses;
+                    }
                 }
             }
         }
@@ -719,7 +734,16 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
     std::vector<std::string> all_rcpts = env_.rcpt_to;
 
     for (const auto& hdr : { "cc", "bcc" }) {
+        if (all_rcpts.size() >= kMaxRecipients) {
+            break;
+        }
+
         for (const auto& addr : extract_address(env_.body, hdr)) {
+            if (all_rcpts.size() >= kMaxRecipients) {
+                logger.warn("[DELIVER] Recipient cap reached, ignoring the rest of the header recipients");
+                break;
+            }
+
             auto at = addr.find('@');
             if (at == std::string::npos) {
                 continue;
