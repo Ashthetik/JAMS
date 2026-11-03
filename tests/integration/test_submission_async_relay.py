@@ -4,6 +4,8 @@ import base64, glob, os, socket, ssl, subprocess, threading, time, pytest
 SUBMISSION_PORT = 2587
 FAKE_MX = os.path.join(os.path.dirname(__file__), "..", "tools", "fake_mx.py")
 MX_DELAY = 4  # seconds the slow MX holds back its greeting
+STALL_DELAY = 20  # seconds the stalled MX holds back its greeting
+HOLD_LIMIT = 64 * 1024  # MAX_HELD_INPUT in src/smtp/submission_server.cpp
 
 def recv_until(s, marker, timeout=5):
     s.settimeout(timeout)
@@ -64,6 +66,13 @@ def stop_mx(proc):
 @pytest.fixture
 def slow_mx(tmp_path):
     proc, out_dir = mx_fixture(tmp_path, MX_DELAY)
+    yield out_dir
+    stop_mx(proc)
+
+@pytest.fixture
+def stalled_mx(tmp_path):
+    # Long enough to flood and read the answer while the relay is definitely still out
+    proc, out_dir = mx_fixture(tmp_path, STALL_DELAY)
     yield out_dir
     stop_mx(proc)
 
@@ -136,3 +145,49 @@ def test_failed_relay_answers_and_session_carries_on(jams_server):
 
         s.sendall(b"NOOP\r\n")
         assert recv_until(s, b"\r\n").startswith(b"250"), "the session didn't recover after a failed relay"
+
+def drain_until_closed(s, deadline):
+    """Reads until the peer goes away or the deadline passes. Returns (bytes, closed)."""
+    data = b""
+    while time.time() < deadline:
+        s.settimeout(0.5)
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            continue
+        except (ssl.SSLError, OSError):
+            return data, True
+        if not chunk:
+            return data, True
+        data += chunk
+    return data, False
+
+def test_pipelining_past_the_hold_limit_is_refused(jams_server, stalled_mx):
+    s = submission_session()
+    sent, broken = 0, False
+    try:
+        start_message(s, b"flood")
+        s.sendall(b".\r\n")
+        time.sleep(0.5)  # the relay is out now, so everything below is held in memory
+
+        flood = b"NOOP\r\n" * 1024  # 6 KiB a go, all of it legal pipelined commands
+        while sent < HOLD_LIMIT * 4 and not broken:
+            try:
+                s.sendall(flood)
+                sent += len(flood)
+            except (ssl.SSLError, OSError):
+                broken = True
+
+        # Still far inside the relay's window: a server that is holding everything has
+        # said nothing yet, a server that refused the flood has answered and hung up
+        data, closed = drain_until_closed(s, time.time() + 8)
+    finally:
+        s.close()
+
+    assert broken or closed or b"421" in data, (
+        f"{sent} bytes pipelined during a relay were absorbed and the connection kept open: {data[:200]!r}"
+    )
+
+    # Only the offender was dropped
+    with socket.create_connection(("127.0.0.1", SUBMISSION_PORT), timeout=5) as other:
+        assert recv_until(other, b"\r\n").startswith(b"220")

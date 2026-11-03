@@ -7,6 +7,7 @@
 #include "smtp/smtp_session.hpp"
 #include "auth/credentials/aliases.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -73,11 +74,14 @@ namespace SMTP
             tls_upgrade_pending_ = false;
         }
 
-        /// @brief While a relay is out the client is waiting on us, not idle, and the
-        /// relay's own socket timeouts bound how long that can take
+        /// @brief While a relay is out the client is waiting on us, not idle, so it gets
+        /// a grace period rather than the usual timeout. A working relay is bounded by
+        /// its own 30 second socket timeouts and finishes in seconds, so the grace is
+        /// generous for a slow but honest MX while still reaping a connection parked on
+        /// one that never answers. Never shorter than the configured idle timeout
         std::chrono::seconds idle_timeout(std::chrono::seconds fallback) const override
         {
-            return relay_pending_ ? std::chrono::hours(24) : fallback;
+            return relay_pending_ ? std::max(fallback, RELAY_GRACE) : fallback;
         }
     private:
         // Shared with relay jobs, which can outlive the session if the client hangs up
@@ -123,6 +127,10 @@ namespace SMTP
         /// @brief Called back on the loop thread once the relay is done: replies, then
         /// runs whatever the client pipelined in the meantime
         void finish_relay(bool ok);
+
+        /// @brief Buffers bytes the client pipelined while a relay is out. Past the hold
+        /// limit the connection is answered with 421 and closed instead of growing
+        void hold_input(std::span<const uint8_t> bytes);
 
         /// @brief Processes commands received from on-wire data
         /// @param line
@@ -225,8 +233,11 @@ namespace SMTP
 
         bool tls_upgrade_pending_ = false;
 
+        /// @brief How long a connection may sit silent while its relay is out
+        static constexpr std::chrono::seconds RELAY_GRACE{ 600 };
+
         bool relay_pending_{ false };
-        std::string held_input_; // bytes pipelined while a relay is out
+        std::string held_input_; // bytes pipelined while a relay is out, capped
         std::shared_ptr<bool> alive_{ std::make_shared<bool>(true) }; // false once the session is gone
     };
 }
