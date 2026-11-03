@@ -566,6 +566,23 @@ void Session::cmd_create(const std::string& tag, const std::string& args) {
 std::atomic<uint32_t> Session::append_seq_{ 0 };
 
 void Session::complete_append() {
+    /**
+     * The message is on its way to disk, so the in-memory copy is dead weight
+     * the moment this returns. Drop it on every exit path, the failure one
+     * included: clear() keeps the capacity, so without the swap a single upload
+     * pins up to MAX_APPEND_SIZE per connection until the client disconnects.
+     */
+    struct AppendStateGuard {
+        Session* self;
+
+        ~AppendStateGuard() {
+            std::vector<uint8_t>().swap(self->literal_buf_);
+            self->append_tag_.clear();
+            self->append_mailbox_.clear();
+            self->append_flags_.clear();
+        }
+    } append_state_guard{ this };
+
     auto now = std::chrono::system_clock::now();
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(
         now.time_since_epoch()
