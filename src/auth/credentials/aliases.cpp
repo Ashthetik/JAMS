@@ -68,66 +68,63 @@ bool Aliases::add(
     return ok;
 }
 
-bool Aliases::accept_and_consume(const std::string& alias) {
+/**
+ * Read-only on purpose. RCPT is reachable without authentication and no message
+ * exists yet, so naming an alias as a recipient must not spend anything: a
+ * stranger could otherwise burn every use of a one-time alias and never send
+ * mail. NULL max_uses / expires_at both mean "no limit".
+ */
+bool Aliases::accept(const std::string& alias) {
     static constexpr const char* SEL =
-        "SELECT active, expires_at, max_uses, uses_count "
-        "FROM aliases WHERE alias = ?;";
+        "SELECT 1 FROM aliases WHERE alias = ? AND active = 1 "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND (max_uses IS NULL OR uses_count < max_uses);";
 
     sqlite3_stmt* stmt{ nullptr };
     if (sqlite3_prepare_v2(db_, SEL, -1, &stmt, nullptr) != SQLITE_OK) {
-        logger.error("[ALIAS] accept_and_consume prepare failed: " + std::string(sqlite3_errmsg(db_)));
+        logger.error("[ALIAS] accept prepare failed: " + std::string(sqlite3_errmsg(db_)));
         return false;
     }
+
     sqlite3_bind_text(stmt, 1, alias.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(std::time(nullptr)));
 
-    if (sqlite3_step(stmt) != SQLITE_ROW) {
-        sqlite3_finalize(stmt);
-        return false; // not an alias at all
-    }
-
-    bool active = sqlite3_column_int(stmt, 0) != 0;
-    bool has_expiry = sqlite3_column_type(stmt, 1) != SQLITE_NULL;
-    int64_t expires_at = has_expiry ? sqlite3_column_int64(stmt, 1) : 0;
-    bool has_max_uses = sqlite3_column_type(stmt, 2) != SQLITE_NULL;
-    int max_uses = has_max_uses ? sqlite3_column_int(stmt, 2) : 0;
-    int uses_count = sqlite3_column_int(stmt, 3);
+    bool usable = sqlite3_step(stmt) == SQLITE_ROW;
     sqlite3_finalize(stmt);
 
-    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    return usable;
+}
 
-    bool expired = !active
-        || (has_expiry && now >= expires_at)
-        || (has_max_uses && uses_count >= max_uses);
+/**
+ * Called once per alias after a message has actually been stored for it. One
+ * conditional statement, so the same limits are re-checked at the moment of
+ * spending and a use can never be taken from an alias that has none left.
+ */
+bool Aliases::consume(const std::string& alias) {
+    static constexpr const char* UPD =
+        "UPDATE aliases SET uses_count = uses_count + 1, "
+        "active = CASE WHEN max_uses IS NOT NULL AND uses_count + 1 >= max_uses THEN 0 ELSE active END "
+        "WHERE alias = ? AND active = 1 "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "AND (max_uses IS NULL OR uses_count < max_uses);";
 
-    if (expired) {
-        // deactivate — idempotent, harmless if already inactive
-        static constexpr const char* DEACT = "UPDATE aliases SET active = 0 WHERE alias = ?;";
-        sqlite3_stmt* d{ nullptr };
-        sqlite3_prepare_v2(db_, DEACT, -1, &d, nullptr);
-        sqlite3_bind_text(d, 1, alias.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(d);
-        sqlite3_finalize(d);
+    sqlite3_stmt* stmt{ nullptr };
+    if (sqlite3_prepare_v2(db_, UPD, -1, &stmt, nullptr) != SQLITE_OK) {
+        logger.error("[ALIAS] consume prepare failed: " + std::string(sqlite3_errmsg(db_)));
         return false;
     }
 
-    static constexpr const char* UPD =
-        "UPDATE aliases SET uses_count = uses_count + 1 WHERE alias = ?;";
-    sqlite3_stmt* upd{ nullptr };
-    sqlite3_prepare_v2(db_, UPD, -1, &upd, nullptr);
-    sqlite3_bind_text(upd, 1, alias.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(upd);
-    sqlite3_finalize(upd);
+    sqlite3_bind_text(stmt, 1, alias.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(std::time(nullptr)));
 
-    if (has_max_uses && uses_count + 1 >= max_uses) {
-        static constexpr const char* DEACT = "UPDATE aliases SET active = 0 WHERE alias = ?;";
-        sqlite3_stmt* d{ nullptr };
-        sqlite3_prepare_v2(db_, DEACT, -1, &d, nullptr);
-        sqlite3_bind_text(d, 1, alias.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(d);
-        sqlite3_finalize(d);
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+    sqlite3_finalize(stmt);
+
+    if (!ok) {
+        logger.warn("[ALIAS] consume spent nothing for: " + alias);
     }
 
-    return true;
+    return ok;
 }
 
 // aliases.cpp
