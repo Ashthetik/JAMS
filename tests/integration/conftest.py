@@ -37,7 +37,12 @@ def jams_server():
 
     # Seed the test accounts first; a non-zero exit just means one already exists from an earlier run.
     # traversal-victim is a second real mailbox for the cross-account tests to aim at.
-    for username, password in [("ci-test-user", "ci-test-password"), ("traversal-victim", "victim-password")]:
+    # delivery-fail-user's mailbox gets blocked on purpose by test_delivery_failures.py.
+    for username, password in [
+        ("ci-test-user", "ci-test-password"),
+        ("traversal-victim", "victim-password"),
+        ("delivery-fail-user", "delivery-fail-password"),
+    ]:
         subprocess.run(
             sudo + [JAMS_BIN, "--add-user", username, password],
             cwd=os.path.dirname(JAMS_CONFIG),
