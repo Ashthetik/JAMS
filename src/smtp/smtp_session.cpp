@@ -27,7 +27,17 @@ void Session::on_data(std::span<const uint8_t> bytes) {
         if (state_ == SMTPState::Data) {
             // in DATA mode, accumulate the raw bytes
             // and detect teh EOD sequence: CRLF.CRLF
-            line_buf += static_cast<char>(b);
+            // Past the size limit stop storing, and only watch for the end: the 552
+            // can't be sent until the sender finishes (RFC 5321 4.2.5)
+            if (!data_too_big_) {
+                line_buf += static_cast<char>(b);
+
+                if (line_buf.size() > MAX_MESSAGE_SIZE + 5) {
+                    data_too_big_ = true;
+                    line_buf.clear();
+                    line_buf.shrink_to_fit();
+                }
+            }
 
             data_tail_ += static_cast<char>(b);
             if (data_tail_.size() > 5) {
@@ -35,6 +45,16 @@ void Session::on_data(std::span<const uint8_t> bytes) {
             }
 
             if (data_tail_ == "\r\n.\r\n") {
+                if (data_too_big_) {
+                    data_too_big_ = false;
+                    data_tail_.clear();
+
+                    reply_code(552, "5.3.4 Message size exceeds fixed maximum message size");
+                    state_ = SMTPState::Greeted;
+                    env_ = {};
+                    continue;
+                }
+
                 env_.body = line_buf.substr(
                     0, line_buf.size() - 5
                 ); // remove the "\r\n.\r\n"
@@ -43,12 +63,15 @@ void Session::on_data(std::span<const uint8_t> bytes) {
 
                 if (deliver()) {
                     reply_code(250, "OK: Message Accepted");
-                    state_ = SMTPState::Greeted;
-                    env_ = {};
                 }
                 else {
                     reply_code(452, "Insufficient Storage");
                 }
+
+                // Either way the transaction is over. Staying in Data after a 452
+                // would read the sender's next commands as message text
+                state_ = SMTPState::Greeted;
+                env_ = {};
             }
         }
         else {
@@ -135,7 +158,7 @@ void Session::cmd_ehlo(std::string_view arg) {
         get_hostname() + " greets " + client_helo_,
         "8BITMIME",
         "PIPELINING",
-        "SIZE 52428800",   // 50 MB max message size
+        "SIZE " + std::to_string(MAX_MESSAGE_SIZE),
         "STARTTLS",
         });
     state_ = SMTPState::Greeted;
@@ -168,6 +191,11 @@ void Session::cmd_mail(std::string_view arg) {
     auto addr = std::string(extract_address(arg.substr(5)));
     if (addr.empty()) {
         reply_code(501, "Empty MAIL FROM:<...>");
+        return;
+    }
+
+    if (declared_size_too_big(upper)) {
+        reply_code(552, "5.3.4 Message size exceeds fixed maximum message size");
         return;
     }
 
@@ -368,8 +396,10 @@ bool Session::deliver() {
 
     for (const auto& rcpt : env_.rcpt_to) {
         // Extract local/account name (before @)
-        auto at = rcpt.find('@');
+        // Cut at the '@' in the resolved target, not in rcpt: an alias and its target
+        // are different lengths, and cutting at rcpt's offset picked the wrong mailbox
         std::string target = aliases_.resolve(rcpt);
+        auto at = target.find('@');
         std::string mailbox_user = (at != std::string::npos) ? target.substr(0, at) : target;
 
         if (!Storage::MailDir::is_safe(mailbox_user)) {
@@ -399,6 +429,9 @@ bool Session::deliver() {
         if (!stored_path) {
             logger.error("[DELIVER] Failed for: " + rcpt);
             all_ok = false;
+
+            // Nothing was stored, so there's nothing for an alias purge to point at
+            continue;
         }
 
         if (target != rcpt) {

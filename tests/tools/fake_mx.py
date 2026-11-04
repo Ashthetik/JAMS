@@ -5,11 +5,14 @@ Listens on <address>:25, accepts every message, and writes each one (with
 dot-stuffing removed) to <output-dir>/<n>.eml, readable by everyone.
 Port 25 is privileged, so tests start it with sudo.
 
-Usage: fake_mx.py <address> <output-dir>
+Usage: fake_mx.py <address> <output-dir> [greeting-delay-seconds]
+
+The optional delay holds back each 220 greeting, to play a slow remote server.
 """
-import os, socket, sys
+import os, socket, sys, time
 
 address, out_dir = sys.argv[1], sys.argv[2]
+greeting_delay = float(sys.argv[3]) if len(sys.argv) > 3 else 0
 
 server = socket.socket()
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -20,6 +23,7 @@ count = 0
 while True:
     conn, _ = server.accept()
     stream = conn.makefile("rb")
+    time.sleep(greeting_delay)
     conn.sendall(b"220 fake-mx ESMTP\r\n")
 
     data, in_data = b"", False
