@@ -132,7 +132,17 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
         if (state_ == State::Data) {
             // in DATA mode, accumulate the raw bytes
             // and detect teh EOD sequence: CRLF.CRLF
-            line_buf_ += static_cast<char>(b);
+            // Past the size limit stop storing, and only watch for the end: the 552
+            // can't be sent until the sender finishes (RFC 5321 4.2.5)
+            if (!data_too_big_) {
+                line_buf_ += static_cast<char>(b);
+
+                if (line_buf_.size() > MAX_MESSAGE_SIZE + 5) {
+                    data_too_big_ = true;
+                    line_buf_.clear();
+                    line_buf_.shrink_to_fit();
+                }
+            }
 
             data_tail_ += static_cast<char>(b);
             if (data_tail_.size() > 5) {
@@ -140,6 +150,16 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
             }
 
             if (data_tail_ == "\r\n.\r\n") {
+                if (data_too_big_) {
+                    data_too_big_ = false;
+                    data_tail_.clear();
+
+                    reply(552, "5.3.4 Message size exceeds fixed maximum message size");
+                    state_ = State::Authenticated;
+                    env_ = {};
+                    continue;
+                }
+
                 env_.body = line_buf_.substr(
                     0, line_buf_.size() - 5
                 ); // remove the "\r\n.\r\n"
@@ -211,6 +231,14 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
     }
 }
 
+/**
+ * RFC 5321 4.5.3 caps a transaction at 100 recipients and cmd_rcpt enforces that on the
+ * envelope. Cc/Bcc collection adds recipients the envelope never named, so it answers to
+ * the same ceiling and one message never fans out past it. Uncapped, a single header line
+ * full of addresses would turn into that many local deliveries.
+ */
+constexpr size_t kMaxRecipients = 100;
+
 auto SubmissionServer::extract_address(const std::string& body, const std::string& header_name) {
     std::vector<std::string> addresses = {};
     std::istringstream ss(body);
@@ -218,11 +246,14 @@ auto SubmissionServer::extract_address(const std::string& body, const std::strin
     bool in_header{ false };
 
     while (std::getline(ss, line)) {
-        if (line.empty() && line.back() == '\r') {
+        // back() on an empty line reads data()[-1], so the guard has to be !empty()
+        if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
 
         if (line.empty()) {
+            // End of the header block. The body is never scanned for headers,
+            // so a "Cc:" line quoted in a reply is text, not a recipient.
             break;
         }
 
@@ -263,6 +294,10 @@ auto SubmissionServer::extract_address(const std::string& body, const std::strin
 
                 if (!token.empty()) {
                     addresses.push_back(token);
+
+                    if (addresses.size() >= kMaxRecipients) {
+                        return addresses;
+                    }
                 }
             }
         }
@@ -388,7 +423,7 @@ void SubmissionServer::cmd_ehlo(std::string_view arg) {
         get_hostname() + " greets " + client_helo_,
         "8BITMIME",
         "PIPELINING",
-        "SIZE 52428800"
+        "SIZE " + std::to_string(MAX_MESSAGE_SIZE)
     };
 
     if (loop_.is_tls_active(conn_id_)) {
@@ -593,6 +628,11 @@ void SubmissionServer::cmd_mail(std::string_view arg) {
 
     auto addr = std::string(extract_address(arg.substr(5)));
 
+    if (declared_size_too_big(upper)) {
+        reply(552, "5.3.4 Message size exceeds fixed maximum message size");
+        return;
+    }
+
     // RFC 6409 6.1: the MSA may only accept senders the authenticated user is allowed to use
     if (!owns_address(addr)) {
         reply(550, "5.7.1 Sender address not owned by the authenticated user");
@@ -721,7 +761,16 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
     std::vector<std::string> delivered_aliases;
 
     for (const auto& hdr : { "cc", "bcc" }) {
+        if (all_rcpts.size() >= kMaxRecipients) {
+            break;
+        }
+
         for (const auto& addr : extract_address(env_.body, hdr)) {
+            if (all_rcpts.size() >= kMaxRecipients) {
+                logger.warn("[DELIVER] Recipient cap reached, ignoring the rest of the header recipients");
+                break;
+            }
+
             auto at = addr.find('@');
             if (at == std::string::npos) {
                 continue;
