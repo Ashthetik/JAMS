@@ -20,10 +20,21 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <chrono>
+#include <unordered_set>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
 
 using namespace SMTP;
 
 namespace {
+    class RelayWorkers;
+
+    /// Set while the pool exists, so shutdown can reach it without constructing one
+    std::atomic<RelayWorkers*> g_relay_workers{ nullptr };
+
     /**
      * Outbound relays run here instead of on the 587 event loop. A relay is a
      * blocking SMTP conversation with 30 second timeouts, so on the loop one
@@ -32,21 +43,16 @@ namespace {
     class RelayWorkers {
     public:
         explicit RelayWorkers(size_t count) {
+            g_relay_workers.store(this);
+
             for (size_t i = 0; i < count; ++i) {
                 threads_.emplace_back([this]() { run(); });
             }
         }
 
         ~RelayWorkers() {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stop_ = true;
-            }
-
-            cv_.notify_all();
-            for (auto& t : threads_) {
-                t.join();
-            }
+            stop_and_join();
+            g_relay_workers.store(nullptr);
         }
 
         void submit(std::function<void()> job) {
@@ -56,6 +62,70 @@ namespace {
             }
 
             cv_.notify_one();
+        }
+
+        /**
+         * Sets stop_ and breaks every relay socket that is in flight. A worker
+         * parked in connect(), recv() or SSL_read() against a remote server never
+         * gets back to the top of its loop to see stop_, so the socket has to be
+         * broken from the outside: shutdown() makes the blocking call return an
+         * error and the worker unwinds through its normal failure path.
+         * Idempotent, and does not wait for anything.
+         */
+        void stop() {
+            std::vector<int> live;
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stop_) {
+                    return;
+                }
+
+                stop_ = true;
+                live.assign(sockets_.begin(), sockets_.end());
+            }
+
+            for (int fd : live) {
+                ::shutdown(fd, SHUT_RDWR);
+            }
+
+            cv_.notify_all();
+        }
+
+        /// @brief stop(), then wait for the workers. Safe to call more than once
+        void stop_and_join() {
+            stop();
+
+            std::lock_guard<std::mutex> lock(join_mutex_);
+            for (auto& t : threads_) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        }
+
+        bool stopping() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return stop_;
+        }
+
+        /// @brief Puts a relay socket where stop() can find it. False once shutdown
+        /// has begun, so no conversation is started that nobody would be able to break
+        bool register_socket(int fd) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_) {
+                return false;
+            }
+
+            sockets_.insert(fd);
+            return true;
+        }
+
+        /// @brief Must happen before the fd is closed: once closed the number can be
+        /// recycled by another connection, and stop() would then break that one instead
+        void unregister_socket(int fd) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sockets_.erase(fd);
         }
 
     private:
@@ -83,16 +153,95 @@ namespace {
             }
         }
 
-        std::mutex mutex_;
+        mutable std::mutex mutex_;
+        std::mutex join_mutex_;
         std::condition_variable cv_;
         std::deque<std::function<void()>> jobs_;
         std::vector<std::thread> threads_;
+        std::unordered_set<int> sockets_;
         bool stop_{ false };
     };
 
     RelayWorkers& relay_workers() {
         static RelayWorkers workers(4);
         return workers;
+    }
+
+    /// @brief How long a relay may spend waiting for a remote server to accept the
+    /// connection. Matches the send/receive timeouts already set on the socket
+    constexpr std::chrono::seconds RELAY_CONNECT_TIMEOUT{ 30 };
+
+    /**
+     * connect() with a deadline, re-checked often enough that a shutdown is noticed
+     * within a fifth of a second. shutdown() cannot break a socket that is still in
+     * SYN_SENT, so a connect to a black-holed MX is the one relay call the registry
+     * above cannot reach, and it has to bound itself. On return errno carries the
+     * reason, exactly as a blocking connect() would leave it.
+     */
+    bool connect_with_deadline(int sock, const sockaddr* addr, socklen_t len) {
+        const int flags = ::fcntl(sock, F_GETFL, 0);
+
+        if (flags < 0 || ::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            // Can't go non-blocking, so fall back to the old behaviour rather than not connect
+            return ::connect(sock, addr, len) == 0;
+        }
+
+        bool connected = false;
+        int err = 0;
+
+        if (::connect(sock, addr, len) == 0) {
+            connected = true;
+        }
+        else if (errno != EINPROGRESS) {
+            err = errno;
+        }
+        else {
+            const auto deadline = std::chrono::steady_clock::now() + RELAY_CONNECT_TIMEOUT;
+
+            while (!connected && err == 0) {
+                if (relay_workers().stopping()) {
+                    err = ECANCELED;
+                    break;
+                }
+
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    err = ETIMEDOUT;
+                    break;
+                }
+
+                pollfd pfd{ sock, POLLOUT, 0 };
+                int ready = ::poll(&pfd, 1, 200);
+
+                if (ready < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+
+                    err = errno;
+                }
+                else if (ready > 0) {
+                    socklen_t err_len = sizeof(err);
+
+                    if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0) {
+                        err = errno;
+                    }
+
+                    connected = (err == 0);
+                }
+            }
+        }
+
+        ::fcntl(sock, F_SETFL, flags);
+        errno = err;
+
+        return connected;
+    }
+}
+
+void SMTP::stop_relay_workers() {
+    if (RelayWorkers* workers = g_relay_workers.load()) {
+        logger.info("[RELAY] Stopping relay workers");
+        workers->stop_and_join();
     }
 }
 
@@ -875,9 +1024,21 @@ void SubmissionServer::start_relay(
         bool ok = local_ok;
 
         for (const auto& [rcpt, domain] : external) {
-            if (!relay_outbound(*signer, from, rcpt, domain, body)) {
-                logger.error("[DELIVER] Relay failed for: " + rcpt);
+            bool sent = !relay_workers().stopping() && relay_outbound(*signer, from, rcpt, domain, body);
+
+            if (!sent) {
                 ok = false;
+
+                // A message the shutdown gave up on must never vanish without a record
+                if (relay_workers().stopping()) {
+                    logger.error(
+                        "[RELAY] Shutdown abandoned the relay, message from " + from +
+                        " to " + rcpt + " was NOT delivered"
+                    );
+                }
+                else {
+                    logger.error("[DELIVER] Relay failed for: " + rcpt);
+                }
             }
         }
 
@@ -1042,8 +1203,19 @@ bool SubmissionServer::relay_outbound(
             ssl = nullptr;
         }
 
+        // Off the registry first: once closed the fd number can be recycled
+        relay_workers().unregister_socket(sock);
         ::close(sock);
         };
+
+    // From here the socket is breakable from outside, which is what makes shutdown prompt
+    if (!relay_workers().register_socket(sock)) {
+        logger.error("[RELAY] Shutting down, delivery to " + to + " was not attempted");
+
+        ::close(sock);
+        freeaddrinfo(res);
+        return false;
+    }
 
     auto raw_send = [&](const char* data, size_t n) -> ssize_t {
         if (tls_active && ssl) {
@@ -1070,10 +1242,10 @@ bool SubmissionServer::relay_outbound(
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (::connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
+    if (!connect_with_deadline(sock, res->ai_addr, res->ai_addrlen)) {
         logger.error("[RELAY] connect failed for: " + mx_host + " because: " + std::string(strerror(errno)));
 
-        ::close(sock);
+        close_conn();
         freeaddrinfo(res);
         return false;
     }
@@ -1178,7 +1350,7 @@ bool SubmissionServer::relay_outbound(
     bool ok = true;
 
     if (!expect(220)) {
-        ::close(sock);
+        close_conn();
         return false;
     }
 

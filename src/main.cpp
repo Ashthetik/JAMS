@@ -277,6 +277,13 @@ int main(int argc, char* argv[]) {
     imap4_thread.join();
     imap4_secure_thread.join();
 
+    /**
+     * The relay workers outlive the loops, and one parked on a slow remote server
+     * would otherwise only be joined by a static destructor, after main has returned
+     * and with nothing left able to break its socket. Stop them here instead
+     */
+    SMTP::stop_relay_workers();
+
     logger.info("[JAMS] Exiting...");
 
     return server_failed ? EXIT_FAILURE : 0;
