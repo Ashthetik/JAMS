@@ -5,6 +5,7 @@
 #include "globals.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <iostream>
 #include <iterator>
 #include <sstream>
@@ -1070,6 +1071,21 @@ bool SubmissionServer::relay_outbound(
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    /**
+     * Bounds on what the far end is allowed to say. There are only four relay
+     * workers for the whole server, so a conversation that never ends is a
+     * server that never sends mail again
+     *
+     * RFC 5321 4.5.3.1.5 caps a reply line at 512 octets; 4096 is generous for
+     * the MTAs that overrun it. The line and byte caps bound one reply, and the
+     * deadline bounds the whole exchange, because a peer can answer just inside
+     * the 30 second recv timeout forever and never trip it
+     */
+    constexpr size_t max_reply_line = 4096;
+    constexpr size_t max_reply_lines = 128;
+    constexpr size_t max_reply_bytes = 64 * 1024;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+
     if (::connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
         logger.error("[RELAY] connect failed for: " + mx_host + " because: " + std::string(strerror(errno)));
 
@@ -1080,15 +1096,40 @@ bool SubmissionServer::relay_outbound(
 
     freeaddrinfo(res);
 
+    auto out_of_time = [&]() -> bool {
+        if (std::chrono::steady_clock::now() < deadline) {
+            return false;
+        }
+
+        logger.error("[RELAY] Gave up on " + mx_host + ", the exchange ran past its deadline");
+        return true;
+        };
+
     // SMTP Exchange
     auto recv_line = [&]() -> std::string {
         std::string line;
         char c;
 
+        if (out_of_time()) {
+            return {};
+        }
+
         while (raw_recv_byte(c) == 1) {
             line += c;
             if (line.size() >= 2 && line[line.size() - 2] == '\r' && line.back() == '\n') {
                 break;
+            }
+
+            // A peer that never sends a line ending must not grow this string forever
+            if (line.size() >= max_reply_line) {
+                logger.error("[RELAY] Reply line from " + mx_host + " passed " +
+                    std::to_string(max_reply_line) + " bytes with no line ending");
+
+                return {};
+            }
+
+            if (out_of_time()) {
+                return {};
             }
         }
 
@@ -1100,6 +1141,10 @@ bool SubmissionServer::relay_outbound(
         size_t sent = 0;
 
         while (sent < data.size()) {
+            if (out_of_time()) {
+                return false;
+            }
+
             ssize_t n = raw_send(data.data() + sent, data.size() - sent);
 
             if (n <= 0) {
@@ -1122,6 +1167,8 @@ bool SubmissionServer::relay_outbound(
 
     auto expect_multiline = [&](int expected, std::vector<std::string>* out_lines) -> bool {
         std::string last;
+        size_t lines = 0;
+        size_t bytes = 0;
 
         while (true) {
             last = recv_line();
@@ -1133,17 +1180,31 @@ bool SubmissionServer::relay_outbound(
 
             logger.debug("[RELAY] <-- " + last);
 
+            /**
+             * RFC 5321 4.2.1: three digits then '-' while more lines follow, and
+             * ' ' on the last one. A 4th character that is neither ends the reply
+             * as malformed. Reading it as a continuation is what let "250\r\n"
+             * spin forever, since '\r' is neither ' ' nor short enough to error
+             */
+            if (last.size() < 4 || (last[3] != ' ' && last[3] != '-')) {
+                logger.error("[RELAY] Malformed SMTP response: " + last);
+                return false;
+            }
+
+            ++lines;
+            bytes += last.size();
+
+            if (lines > max_reply_lines || bytes > max_reply_bytes) {
+                logger.error("[RELAY] Reply from " + mx_host + " passed the size limit for one response");
+                return false;
+            }
+
             if (out_lines) {
                 out_lines->push_back(last);
             }
 
-            if (last.size() >= 4 && last[3] == ' ') {
+            if (last[3] == ' ') {
                 break;
-            }
-
-            if (last.size() < 4) {
-                logger.error("[RELAY] Malformed SMTP response: " + last);
-                return false;
             }
         }
 
