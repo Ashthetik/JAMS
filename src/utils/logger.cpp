@@ -5,26 +5,27 @@
 
 using namespace Utils;
 
-Logger::Logger(const std::string& filepath, bool& logs_enabled) : logs_enabled_(logs_enabled) {
-    if (logs_enabled == true) {
-        logs_enabled_ = logs_enabled;
+Logger::Logger(const std::string& filepath, bool& logs_enabled) : logs_enabled_(logs_enabled), filepath_(filepath) {
+    // Nothing else here: as a global this runs before main() has turned logging on,
+    // so the file and the writer start with the first line logged (start_locked)
+}
 
-        const std::filesystem::path absolute_path = std::filesystem::weakly_canonical(filepath);
+void Logger::start_locked() {
+    started_ = true;
 
-        std::error_code ec;
-        std::filesystem::create_directories(absolute_path.parent_path(), ec);
+    const std::filesystem::path absolute_path = std::filesystem::weakly_canonical(filepath_);
 
-        file_ = std::ofstream(absolute_path, std::ios::app);
+    std::error_code ec;
+    std::filesystem::create_directories(absolute_path.parent_path(), ec);
 
-        if (!file_.is_open()) {
-            throw std::runtime_error("[logger] [ERROR]: Failed to open: " + filepath);
-            exit(1);
-        }
-        worker_ = std::thread(&Logger::run, this);
+    file_ = std::ofstream(absolute_path, std::ios::app);
+
+    if (!file_.is_open()) {
+        // Keep running: losing the log file shouldn't take the mail server down
+        std::cerr << "[logger] [ERROR]: Failed to open: " << filepath_ << ", logging to the console only" << std::endl;
     }
-    else {
-        logs_enabled_ = false;
-    }
+
+    worker_ = std::thread(&Logger::run, this);
 }
 
 
@@ -42,7 +43,23 @@ void Logger::log(LogLevel level, std::string msg) {
             if (stopping_) {
                 return;
             }
-            queue_.push_back(format(level, msg));
+
+            if (!started_) {
+                start_locked();
+            }
+
+            std::string line = format(level, msg.size() > MAX_LINE_BYTES
+                ? msg.substr(0, MAX_LINE_BYTES) + " ...[" + std::to_string(msg.size() - MAX_LINE_BYTES) + " more bytes]"
+                : msg);
+
+            // The writer has fallen behind: drop and count, instead of holding every line in memory
+            if (queued_bytes_ + line.size() > MAX_QUEUED_BYTES) {
+                ++dropped_;
+            }
+            else {
+                queued_bytes_ += line.size();
+                queue_.push_back(std::move(line));
+            }
         }
 
         // Copy to stdout for info and error
@@ -101,8 +118,12 @@ std::string Logger::format(LogLevel level, std::string msg) const {
     auto t = system_clock::to_time_t(now);
     auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
 
+    // localtime() shares one buffer between threads, and four loops log at once
+    std::tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+
     std::ostringstream oss;
-    oss << std::put_time(std::localtime(&t), "%Y-%m-%d %H:%H:%S")
+    oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
         << '.' << std::setw(3) << std::setfill('0') << ms.count()
         << " [" << to_string(level) << "] "
         << msg << std::endl;
@@ -129,6 +150,12 @@ void Logger::run() {
                 }
 
                 std::swap(local_batch, queue_);
+                queued_bytes_ = 0;
+
+                if (dropped_ > 0) {
+                    local_batch.push_back(format(LogLevel::Warn, "[logger] dropped " + std::to_string(dropped_) + " lines, the writer couldn't keep up"));
+                    dropped_ = 0;
+                }
             }
 
             for (auto& line : local_batch) {

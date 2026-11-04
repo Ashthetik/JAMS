@@ -180,13 +180,21 @@ void Session::process_line(const std::string& line) {
         return;
     }
 
-    if (line.find_first_of("LOGIN \"") == 0) { /// Ignore credentials 
-        logger.debug("[IMAP] " + std::to_string(conn_id_) + " " + line);
-    }
-
     std::istringstream ss(line);
     std::string tag, command;
     ss >> tag >> command;
+
+    // LOGIN and AUTHENTICATE carry credentials on the line, so only their tag and name are logged.
+    // (The old find_first_of check matched on the line's first character, so "L1 LOGIN bob pw" was logged in full)
+    std::string upper_command = command;
+    std::transform(upper_command.begin(), upper_command.end(), upper_command.begin(), ::toupper);
+
+    if (upper_command == "LOGIN" || upper_command == "AUTHENTICATE") {
+        logger.debug("[IMAP] " + std::to_string(conn_id_) + " " + tag + " " + upper_command + " [credentials hidden]");
+    }
+    else {
+        logger.debug("[IMAP] " + std::to_string(conn_id_) + " " + line);
+    }
 
     std::string args;
     std::getline(ss, args);
