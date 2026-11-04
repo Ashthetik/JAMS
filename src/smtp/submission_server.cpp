@@ -94,6 +94,16 @@ namespace {
         static RelayWorkers workers(4);
         return workers;
     }
+
+    /**
+     * Ceiling on what we hold for a client while its relay is out. A client waiting
+     * on a reply may legally pipeline the next transaction's commands, but commands
+     * are small: RFC 5321 4.5.3.1 caps a command line at 512 bytes and a transaction
+     * at 100 recipients, so even a whole pipelined envelope is well under this.
+     * Anything past it is not a client waiting for a reply, it is someone filling
+     * our memory, so the connection goes instead of growing
+     */
+    constexpr size_t MAX_HELD_INPUT = 64 * 1024;
 }
 
 SubmissionServer::SubmissionServer(
@@ -123,7 +133,7 @@ void SubmissionServer::on_tls_established() {
 void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
     // While a relay is out, hold whatever the client pipelined after the message
     if (relay_pending_) {
-        held_input_.append(bytes.begin(), bytes.end());
+        hold_input(bytes);
         return;
     }
 
@@ -186,7 +196,7 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
                         env_ = {};
 
                         // Anything after the message waits for the relay's reply
-                        held_input_.append(bytes.begin() + i + 1, bytes.end());
+                        hold_input(bytes.subspan(i + 1));
                         return;
                     }
 
@@ -888,6 +898,33 @@ void SubmissionServer::start_relay(
             }
             });
         });
+}
+
+void SubmissionServer::hold_input(std::span<const uint8_t> bytes) {
+    // Already gave up on this connection: don't buffer any more of it, don't answer twice
+    if (pending_close_) {
+        return;
+    }
+
+    if (held_input_.size() + bytes.size() > MAX_HELD_INPUT) {
+        logger.warn(
+            "[SUBMISSION] " + std::to_string(conn_id_) + " pipelined "
+            + std::to_string(held_input_.size() + bytes.size())
+            + " bytes during a relay, over the " + std::to_string(MAX_HELD_INPUT)
+            + " byte hold limit, closing"
+        );
+
+        held_input_.clear();
+        held_input_.shrink_to_fit();
+
+        reply(421, "4.7.0 Too much pipelined data, closing connection");
+        state_ = State::Done;
+        pending_close_ = true;
+        loop_.submit_close(conn_id_);
+        return;
+    }
+
+    held_input_.append(bytes.begin(), bytes.end());
 }
 
 void SubmissionServer::finish_relay(bool ok) {
