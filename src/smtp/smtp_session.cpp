@@ -271,8 +271,9 @@ void Session::cmd_rcpt(std::string_view arg) {
 
     if (is_alias) {
         logger.warn("[SMTP] treated as alias: addr='" + addr + "'");
-        if (!aliases_.accept_and_consume(addr)) {
-            logger.warn("[SMTP] accept_and_consume rejected: " + addr);
+        // Checked only: the use is spent in deliver(), once a message exists
+        if (!aliases_.accept(addr)) {
+            logger.warn("[SMTP] alias rejected: " + addr);
             reply_code(550, "Mailbox unavailable");
             return;
         }
@@ -391,6 +392,7 @@ bool Session::deliver() {
     // TODO: Encrypt before writing
     bool all_ok = true;
     std::vector<std::string> all_rcpts = env_.rcpt_to;
+    std::vector<std::string> delivered_aliases;
 
     std::string clean_body = strip_header(env_.body, "bcc");
 
@@ -436,7 +438,22 @@ bool Session::deliver() {
 
         if (target != rcpt) {
             aliases_.schedule_purge(rcpt, mailbox_user, *stored_path);
+
+            // One use per alias per message, no matter how often it was named
+            if (std::find(delivered_aliases.begin(), delivered_aliases.end(), rcpt) == delivered_aliases.end()) {
+                delivered_aliases.push_back(rcpt);
+            }
         }
+    }
+
+    /**
+     * Spending happens here and not at RCPT, so a use only goes when a message
+     * was really stored. Left until the loop is done because consuming the last
+     * use deactivates the alias, and resolve() must keep working for every
+     * recipient of this message.
+     */
+    for (const auto& alias : delivered_aliases) {
+        aliases_.consume(alias);
     }
 
     return all_ok;

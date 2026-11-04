@@ -45,7 +45,13 @@ namespace Auth
 
         bool is_domain_allowed(const std::string &alias, const std::string &sender_domain);
 
-        bool accept_and_consume(const std::string &alias);
+        /// @brief Is this alias usable right now? Read-only: spends nothing.
+        /// Called at RCPT, where no message exists yet.
+        bool accept(const std::string &alias);
+
+        /// @brief Spend one use, and deactivate the alias if that was the last one.
+        /// Called once per alias after a message has actually been stored for it.
+        bool consume(const std::string &alias);
 
         void schedule_purge(const std::string &alias, const std::string &username, const std::string &maildir);
 

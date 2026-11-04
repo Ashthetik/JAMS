@@ -703,7 +703,8 @@ void SubmissionServer::cmd_rcpt(std::string_view arg) {
     bool is_alias = (resolved != addr);
 
     if (is_alias) {
-        if (!aliases_.accept_and_consume(addr)) {
+        // Checked only: the use is spent in deliver(), once a message exists
+        if (!aliases_.accept(addr)) {
             reply(550, "Mailbox unavailable");
             return;
         }
@@ -757,6 +758,7 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
     std::string local_domain = get_hostname();
     std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
     std::vector<std::string> all_rcpts = env_.rcpt_to;
+    std::vector<std::string> delivered_aliases;
 
     for (const auto& hdr : { "cc", "bcc" }) {
         if (all_rcpts.size() >= kMaxRecipients) {
@@ -851,12 +853,27 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
 
             if (target != rcpt) {
                 aliases_.schedule_purge(rcpt, mailbox_user, *stored_path);
+
+                // One use per alias per message, no matter how often it was named
+                if (std::find(delivered_aliases.begin(), delivered_aliases.end(), rcpt) == delivered_aliases.end()) {
+                    delivered_aliases.push_back(rcpt);
+                }
             }
         }
         else {
             // Relayed off the event loop, see start_relay()
             external.emplace_back(rcpt, domain);
         }
+    }
+
+    /**
+     * Spending happens here and not at RCPT, so a use only goes when a message
+     * was really stored. Left until the loop is done because consuming the last
+     * use deactivates the alias, and resolve() must keep working for every
+     * recipient of this message.
+     */
+    for (const auto& alias : delivered_aliases) {
+        aliases_.consume(alias);
     }
 
     return all_ok;
