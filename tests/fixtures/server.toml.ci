@@ -11,6 +11,10 @@ submissions = 2587
 [database]
 dbpath = "/tmp/jams/db/users.db"
 
+[reporting]
+# Login-from-a-new-IP alerts go here. It has to be a local mailbox, and traversal-victim is already seeded
+ip_alert_mta = "traversal-victim@test.local"
+
 [limits]
 # Short so the idle timeout tests finish quickly
 idle_timeout = 5
