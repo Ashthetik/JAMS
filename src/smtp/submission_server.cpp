@@ -104,7 +104,8 @@ SubmissionServer::SubmissionServer(
         .domain = get_hostname(),
         .selector = "jams",
         .priv_key_path = "/etc/jams/tls/key.pem"
-    })), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), sasl_(store, remote_ip), aliases_(aliases) {
+    })), conn_id_(conn_id), remote_ip_(remote_ip), loop_(loop), cred_store_(store),
+        sasl_(store, remote_ip), aliases_(aliases) {
     reply(220, get_hostname() + " ESMTP submission");
 }
 
@@ -191,7 +192,7 @@ void SubmissionServer::on_data(std::span<const uint8_t> bytes) {
                     }
 
                     if (local_ok) {
-                        reply(250, "OK: Message Accepted");
+                        reply(250, accepted_text());
                     }
                     else {
                         reply(452, "Insufficient Storage");
@@ -751,12 +752,29 @@ void SubmissionServer::cmd_quit() {
     loop_.submit_close(conn_id_);
 }
 
+std::string SubmissionServer::accepted_text() const {
+    if (dropped_header_rcpts_ == 0) {
+        return "OK: Message Accepted";
+    }
+
+    /**
+     * A dropped Cc/Bcc recipient must not fail the transaction: the envelope
+     * recipients already have their copy, and a 4xx would only make the client
+     * send the whole message again. Saying so on the 250 is how the sender
+     * finds out instead of the address vanishing.
+     */
+    return "OK: Message Accepted, " + std::to_string(dropped_header_rcpts_)
+        + " header recipient(s) not deliverable and dropped";
+}
+
 bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>& external, std::string& relay_body) {
     // TODO: Encrypt before writing
     bool all_ok = true;
     std::string local_domain = get_hostname();
     std::transform(local_domain.begin(), local_domain.end(), local_domain.begin(), ::tolower);
     std::vector<std::string> all_rcpts = env_.rcpt_to;
+
+    dropped_header_rcpts_ = 0;
 
     for (const auto& hdr : { "cc", "bcc" }) {
         if (all_rcpts.size() >= kMaxRecipients) {
@@ -781,9 +799,25 @@ bool SubmissionServer::deliver(std::vector<std::pair<std::string, std::string>>&
                 continue;
             }
 
-            if (std::find(all_rcpts.begin(), all_rcpts.end(), addr) == all_rcpts.end()) {
-                all_rcpts.push_back(addr);
+            if (std::find(all_rcpts.begin(), all_rcpts.end(), addr) != all_rcpts.end()) {
+                continue;
             }
+
+            /**
+             * Header recipients never pass through cmd_rcpt, and every
+             * recipient check this server has lives there. Without the
+             * existence check repeated here, a Cc naming a local address with
+             * no account behind it reaches MailDir::ensure_dirs() and a brand
+             * new mailbox is created on disk for a user who does not exist.
+             */
+            if (aliases_.resolve(addr) == addr && !cred_store_.is_active_user(addr.substr(0, at))) {
+                logger.warn("[DELIVER] Dropped header recipient with no mailbox: " + addr);
+                ++dropped_header_rcpts_;
+
+                continue;
+            }
+
+            all_rcpts.push_back(addr);
         }
     }
 
@@ -894,7 +928,7 @@ void SubmissionServer::finish_relay(bool ok) {
     relay_pending_ = false;
 
     if (ok) {
-        reply(250, "OK: Message Accepted");
+        reply(250, accepted_text());
     }
     else {
         reply(452, "Insufficient Storage");
