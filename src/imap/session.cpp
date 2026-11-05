@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 
@@ -985,6 +986,58 @@ std::string Session::build_body(const MessageMeta& msg) const {
         + std::to_string(msg.size) + " NIL NIL NIL)";
 }
 
+namespace {
+    // RFC 3501 2.3.2: the system flags a client is allowed to set. \Recent is
+    // deliberately absent, a client may not set it.
+    constexpr std::string_view SYSTEM_FLAGS[] = {
+        "\\SEEN", "\\ANSWERED", "\\FLAGGED", "\\DELETED", "\\DRAFT"
+    };
+
+    // RFC 3501 9: a keyword is an atom, so it carries none of these.
+    constexpr std::string_view ATOM_SPECIALS = "(){ %*\"\\]";
+
+    // Longest single flag, and the ceiling on everything one message may carry,
+    // so that even well-formed keywords cannot be piled up without limit.
+    constexpr size_t MAX_FLAG_LEN = 64;
+    constexpr size_t MAX_FLAGS_LEN = 1024;
+
+    bool valid_flag(const std::string& flag) {
+        if (flag.empty() || flag.size() > MAX_FLAG_LEN) {
+            return false;
+        }
+
+        if (flag.front() == '\\') {
+            std::string upper = flag;
+            std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+            return std::find(
+                std::begin(SYSTEM_FLAGS), std::end(SYSTEM_FLAGS), upper
+            ) != std::end(SYSTEM_FLAGS);
+        }
+
+        for (unsigned char c : flag) {
+            if (c < 0x20 || c == 0x7F || ATOM_SPECIALS.find(c) != std::string_view::npos) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool valid_flag_list(const std::string& flags) {
+        std::istringstream fs(flags);
+        std::string flag;
+
+        while (fs >> flag) {
+            if (!valid_flag(flag)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
 void Session::cmd_store(const std::string& tag, const std::string& args, bool by_uid) {
     if (read_only_) {
         no(tag, "[READ-ONLY] Mailbox is read-only");
@@ -1008,11 +1061,25 @@ void Session::cmd_store(const std::string& tag, const std::string& args, bool by
 
     flags_str = trim(flags_str);
 
+    // Anything that is not a flag is a protocol error, not something to store.
+    // Without this the client's text is appended verbatim, every later reply
+    // reads the whole accumulated string back, and nothing ever shrinks it.
+    if (!valid_flag_list(flags_str)) {
+        bad(tag, "Invalid flag list");
+        return;
+    }
+
+    if (flags_str.size() > MAX_FLAGS_LEN) {
+        no(tag, "[LIMIT] Too many flags");
+        return;
+    }
+
     // Normalise the action to UPPERCASE
     std::string upper = action;
     std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
 
     auto seqs = parse_sequence_set(seq_str, by_uid);
+    bool capped = false;
 
     for (uint32_t seq : seqs) {
         auto itr = std::find_if(
@@ -1030,7 +1097,14 @@ void Session::cmd_store(const std::string& tag, const std::string& args, bool by
         }
         else if (upper == "+FLAGS" || upper == "+FLAGS.SILENT") {
             if (itr->flags.find(flags_str) == std::string::npos) {
-                itr->flags += (itr->flags.empty() ? "" : " ") + flags_str;
+                size_t sep = itr->flags.empty() ? 0 : 1;
+
+                if (itr->flags.size() + sep + flags_str.size() > MAX_FLAGS_LEN) {
+                    capped = true;
+                }
+                else {
+                    itr->flags += (itr->flags.empty() ? "" : " ") + flags_str;
+                }
             }
         }
         else if (upper == "-FLAGS" || upper == "-FLAGS.SILENT") {
@@ -1089,6 +1163,11 @@ void Session::cmd_store(const std::string& tag, const std::string& args, bool by
             untagged(std::to_string(seq) + " FETCH (FLAGS (" + itr->flags + ")"
                 + (by_uid ? " UID " + std::to_string(itr->uuid) : "") + ")");
         }
+    }
+
+    if (capped) {
+        no(tag, "[LIMIT] Too many flags");
+        return;
     }
 
     ok(tag, "STORE completed");
