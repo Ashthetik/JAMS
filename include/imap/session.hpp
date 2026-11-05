@@ -191,6 +191,18 @@ namespace IMAP {
         /// @param mailbox 
         void load_mailbox(const std::string& mailbox);
 
+        /// @brief Reads a mailbox's Maildir into `out` and reports its UID state. Nothing
+        /// about the session's own view is touched, so this can answer for a mailbox the
+        /// client has not selected. Callers hold uuid_map_mutex_
+        /// @param mailbox 
+        /// @param out 
+        /// @param validity 
+        /// @param next 
+        void collect_mailbox(
+            const std::string& mailbox, std::vector<MessageMeta>& out,
+            uint32_t& validity, uint32_t& next
+        );
+
         /// @brief Scans the new/ directory for any messages that may have arrived
         /// @return 
         size_t scan_new() const;
@@ -198,10 +210,16 @@ namespace IMAP {
         /// @brief Moves new/ messages to cur/ to mark that it's been seen by the server
         void incorporate_new();
 
-        /// @brief Gives every loaded message its UID from the mailbox's jams-uidlist,
+        /// @brief Gives every message in `messages` its UID from the mailbox's jams-uidlist,
         /// assigns new messages UIDs above every earlier one, then orders messages by UID
         /// @param mailbox 
-        void assign_uuids(const std::string& mailbox);
+        /// @param messages 
+        /// @param validity 
+        /// @param next 
+        void assign_uuids(
+            const std::string& mailbox, std::vector<MessageMeta>& messages,
+            uint32_t& validity, uint32_t& next
+        );
 
         /// @brief Reads a mailbox's jams-uidlist
         /// @return false if the file is missing or unreadable
