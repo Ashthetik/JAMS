@@ -277,6 +277,11 @@ void Async::IoUringLoop::run() {
 }
 
 void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
+    // arm_accept() points the next accept at this same client_addr_ and submits
+    // inline, so the kernel can overwrite it with the next backlogged peer before
+    // submit() even returns. Keep our own copy while it is still ours.
+    const sockaddr_in peer = client_addr_;
+
     // Always re-arm accept first so we don't miss new connections
     arm_accept();
 
@@ -291,7 +296,7 @@ void Async::IoUringLoop::on_accept(int /*fd*/, int res) {
 
     // TODO: Log the new connection: Preferably with DB writes
     char ip_buf[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &client_addr_.sin_addr, ip_buf, sizeof(ip_buf));
+    inet_ntop(AF_INET, &peer.sin_addr, ip_buf, sizeof(ip_buf));
 
     // One address can't take every slot, so the cap only shuts out whoever is hogging it
     size_t from_ip = 0;
