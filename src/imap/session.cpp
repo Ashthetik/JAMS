@@ -808,25 +808,130 @@ void Session::cmd_lsub(const std::string& tag, const std::string& /* args */) {
 }
 
 void Session::cmd_status(const std::string& tag, const std::string& args) {
-    // STATUS will show the messages unseen
     std::istringstream ss(args);
     std::string mbox, items_str;
 
     ss >> mbox;
     std::getline(ss, items_str);
 
-    size_t unseen = 0;
+    if (mbox.size() >= 2 && mbox.front() == '"' && mbox.back() == '"') {
+        mbox = mbox.substr(1, mbox.size() - 2);
+    }
 
-    for (const auto& message : messages_) {
+    if (mbox.empty()) {
+        bad(tag, "STATUS requires a mailbox name and data items");
+        return;
+    }
+
+    // normalise inbox to UPPERCASE
+    std::string u_mbox = mbox;
+    std::transform(u_mbox.begin(), u_mbox.end(), u_mbox.begin(), ::toupper);
+
+    if (u_mbox == "INBOX") {
+        mbox = "INBOX";
+    }
+
+    if (!is_valid_mailbox_name(mbox)) {
+        no(tag, "[NONEXISTENT] Invalid mailbox name");
+        return;
+    }
+
+    // STATUS answers for a mailbox the client has not opened, so a missing one is a NO
+    // rather than an OK full of zeroes (RFC 3501 6.3.10)
+    struct stat st {};
+    if (::stat(mailbox_root(mbox).c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        no(tag, "[NONEXISTENT] Mailbox does not exist");
+        return;
+    }
+
+    // The data items arrive parenthesised: STATUS INBOX (MESSAGES UNSEEN)
+    auto open_paren = items_str.find('(');
+    auto close_paren = items_str.rfind(')');
+
+    if (open_paren == std::string::npos || close_paren == std::string::npos || close_paren < open_paren) {
+        bad(tag, "STATUS requires a parenthesised data item list");
+        return;
+    }
+
+    std::istringstream items_ss(items_str.substr(open_paren + 1, close_paren - open_paren - 1));
+    std::vector<std::string> items;
+    std::string item;
+
+    while (items_ss >> item) {
+        std::transform(item.begin(), item.end(), item.begin(), ::toupper);
+
+        if (
+            item != "MESSAGES" && item != "RECENT" && item != "UIDNEXT"
+            && item != "UIDVALIDITY" && item != "UNSEEN"
+            ) {
+            bad(tag, "Unsupported STATUS data item: " + item);
+            return;
+        }
+
+        items.push_back(item);
+    }
+
+    if (items.empty()) {
+        bad(tag, "STATUS requires at least one data item");
+        return;
+    }
+
+    /**
+     * Read the named mailbox straight off disk into locals. The session's own view
+     * belongs to whatever is selected, and STATUS must not disturb it: no renumbering,
+     * no EXISTS/RECENT for somebody else's folder, and a following FETCH still answers
+     * for the selected mailbox
+     */
+    std::vector<MessageMeta> messages;
+    uint32_t validity = 0;
+    uint32_t next = 1;
+    {
+        std::lock_guard<std::mutex> lock(uuid_map_mutex_);
+        collect_mailbox(mbox, messages, validity, next);
+    }
+
+    size_t unseen = 0;
+    size_t recent = 0;
+
+    for (const auto& message : messages) {
         if (message.flags.find("\\Seen") == std::string::npos) {
             ++unseen;
         }
+
+        // Anything still in new/ has not been reported to a client yet
+        if (!message.in_cur) {
+            ++recent;
+        }
     }
 
-    std::string response = "STATUS " + mbox + " (MESSAGES "
-        + std::to_string(messages_.size())
-        + " UNSEEN " + std::to_string(unseen)
-        + " UIDNEXT " + std::to_string(next_uuid_) + ")";
+    // Only the items the client asked for, in the order it asked for them
+    std::string response = "STATUS " + mbox + " (";
+
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) {
+            response += " ";
+        }
+
+        response += items[i] + " ";
+
+        if (items[i] == "MESSAGES") {
+            response += std::to_string(messages.size());
+        }
+        else if (items[i] == "RECENT") {
+            response += std::to_string(recent);
+        }
+        else if (items[i] == "UIDNEXT") {
+            response += std::to_string(next);
+        }
+        else if (items[i] == "UIDVALIDITY") {
+            response += std::to_string(validity);
+        }
+        else {
+            response += std::to_string(unseen);
+        }
+    }
+
+    response += ")";
 
     untagged(response);
     ok(tag, "STATUS completed");
@@ -1231,8 +1336,18 @@ void Session::load_mailbox(const std::string& mailbox) {
     // from new/ to cur/ on another thread can't slip between the two
     std::lock_guard<std::mutex> lock(uuid_map_mutex_);
 
-    messages_.clear();
-    next_uuid_ = 1;
+    collect_mailbox(mailbox, messages_, uuid_validity_, next_uuid_);
+
+    logger.info("[IMAP] " + std::to_string(conn_id_) + " loaded " + std::to_string(messages_.size()) + " messages from " + mailbox);
+}
+
+void Session::collect_mailbox(
+    const std::string& mailbox, std::vector<MessageMeta>& out,
+    uint32_t& validity, uint32_t& next
+) {
+    out.clear();
+    validity = 0;
+    next = 1;
 
     std::string base = mailbox_root(mailbox);
 
@@ -1273,15 +1388,13 @@ void Session::load_mailbox(const std::string& mailbox) {
             meta.size = static_cast<size_t>(st.st_size);
             meta.in_cur = is_cur;
 
-            messages_.push_back(std::move(meta));
+            out.push_back(std::move(meta));
         }
 
         ::closedir(d);
     }
 
-    assign_uuids(mailbox);
-
-    logger.info("[IMAP] " + std::to_string(conn_id_) + " loaded " + std::to_string(messages_.size()) + " messages from " + mailbox);
+    assign_uuids(mailbox, out, validity, next);
 }
 
 size_t Session::scan_new() const {
@@ -1422,9 +1535,12 @@ void Session::incorporate_new() {
     write_uuid_map(selected_mailbox_, validity, next, known);
 }
 
-void Session::assign_uuids(const std::string& mailbox) {
-    uint32_t validity = 0;
-    uint32_t next = 1;
+void Session::assign_uuids(
+    const std::string& mailbox, std::vector<MessageMeta>& messages,
+    uint32_t& validity, uint32_t& next
+) {
+    validity = 0;
+    next = 1;
     std::unordered_map<std::string, uint32_t> known;
 
     bool dirty = !read_uuid_map(mailbox, validity, next, known);
@@ -1439,7 +1555,7 @@ void Session::assign_uuids(const std::string& mailbox) {
     std::unordered_set<uint32_t> taken;
     std::vector<MessageMeta*> fresh;
 
-    for (auto& msg : messages_) {
+    for (auto& msg : messages) {
         auto itr = known.find(base_name(msg.filename));
 
         if (itr != known.end() && taken.insert(itr->second).second) {
@@ -1463,20 +1579,17 @@ void Session::assign_uuids(const std::string& mailbox) {
 
     // Sequence numbers follow UID order
     std::sort(
-        messages_.begin(), messages_.end(),
+        messages.begin(), messages.end(),
         [](const MessageMeta& a, const MessageMeta& b) {
             return a.uuid < b.uuid;
         });
 
-    for (uint32_t i = 0; i < messages_.size(); i++) {
-        messages_[i].seq = i + 1;
+    for (uint32_t i = 0; i < messages.size(); i++) {
+        messages[i].seq = i + 1;
     }
 
-    uuid_validity_ = validity;
-    next_uuid_ = next;
-
     // Rewrite when something was assigned, or an expunged message's entry can be dropped
-    if (!dirty && fresh.empty() && known.size() == messages_.size()) {
+    if (!dirty && fresh.empty() && known.size() == messages.size()) {
         return;
     }
 
@@ -1487,7 +1600,7 @@ void Session::assign_uuids(const std::string& mailbox) {
     }
 
     std::unordered_map<std::string, uint32_t> current;
-    for (const auto& msg : messages_) {
+    for (const auto& msg : messages) {
         current[base_name(msg.filename)] = msg.uuid;
     }
 
