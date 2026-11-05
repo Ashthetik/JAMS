@@ -178,6 +178,11 @@ namespace SMTP
         /// @return false if any local delivery failed
         bool deliver(std::vector<std::pair<std::string, std::string>>& external, std::string& relay_body);
 
+        /// @brief The 250 text for an accepted message, naming how many header
+        /// recipients were dropped so the sender does not assume they were delivered
+        /// @return
+        std::string accepted_text() const;
+
         /// @brief Trims unwanted data from the given string
         /// @param sv
         /// @return
@@ -191,6 +196,7 @@ namespace SMTP
         uint64_t conn_id_;
         std::string remote_ip_;
         Async::IoUringLoop& loop_;
+        Auth::CredentialStore& cred_store_;
         Auth::SASLSession sasl_;
         Auth::Aliases& aliases_;
 
@@ -223,6 +229,9 @@ namespace SMTP
 
         Envelope env_;
         std::string client_helo_;
+
+        // Header recipients the last deliver() refused to create a mailbox for
+        size_t dropped_header_rcpts_{ 0 };
 
         bool tls_upgrade_pending_ = false;
 
